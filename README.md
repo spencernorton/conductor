@@ -7,7 +7,7 @@
 
 <p align="center">
   <a href="https://norvitech.com"><img alt="NorviTech Suite" src="https://img.shields.io/badge/NorviTech-Suite-FD8024.svg"></a>
-  <a href="https://github.com/spencercnorton/conductor/tags"><img alt="Latest release" src="https://img.shields.io/github/v/tag/spencercnorton/conductor?label=release&sort=semver"></a>
+  <a href="https://github.com/spencernorton/conductor/tags"><img alt="Latest release" src="https://img.shields.io/github/v/tag/spencercnorton/conductor?label=release&sort=semver"></a>
   <a href="#install"><img alt="Docker Compose" src="https://img.shields.io/badge/install-docker%20compose-2496ed.svg?logo=docker&logoColor=white"></a>
   <a href="LICENSE"><img alt="Licence" src="https://img.shields.io/badge/licence-MIT-blue.svg"></a>
   <a href="https://buy.stripe.com/8x26oH2U44f65TRe574wM04"><img alt="Donate" src="https://img.shields.io/badge/donate-Stripe-635bff.svg?logo=stripe&logoColor=white"></a>
@@ -52,7 +52,7 @@ external commercial-detection service before Plex imports it.
 ### Docker — Docker Compose
 
 ```bash
-git clone https://github.com/spencercnorton/conductor.git
+git clone https://github.com/spencernorton/conductor.git
 cd conductor
 cp .env.example .env
 openssl rand -hex 32          # generate each of POSTGRES_PASSWORD, CONDUCTOR_CRED_KEY and CONDUCTOR_ADMIN_API_KEY separately
@@ -104,8 +104,8 @@ there is no telemetry.
 
 ## Contributing and support
 
-- Bugs and feature requests: [open an issue](https://github.com/spencercnorton/conductor/issues/new/choose). Questions: [Discussions](https://github.com/spencercnorton/conductor/discussions).
-- Security reports: [private vulnerability reporting](https://github.com/spencercnorton/conductor/security/advisories/new) — see [SECURITY.md](SECURITY.md). There is no e-mail address; that is deliberate.
+- Bugs and feature requests: [open an issue](https://github.com/spencernorton/conductor/issues/new/choose). Questions: [Discussions](https://github.com/spencernorton/conductor/discussions).
+- Security reports: [private vulnerability reporting](https://github.com/spencernorton/conductor/security/advisories/new) — see [SECURITY.md](SECURITY.md). There is no e-mail address; that is deliberate.
 - Pull requests are welcome; read [CONTRIBUTING.md](CONTRIBUTING.md) first — changes are reviewed and merged on GitHub, then shipped in tagged releases.
 - If Conductor saves you time, you can [support its development](https://buy.stripe.com/8x26oH2U44f65TRe574wM04).
 
@@ -127,14 +127,14 @@ go vet ./...
 </p>
 
 <p align="center">
-  <a href="https://github.com/spencercnorton/helios">Helios</a> ·
-  <a href="https://github.com/spencercnorton/bitagent">BitAgent</a> ·
-  <a href="https://github.com/spencercnorton/xnote">XNote</a> ·
-  <a href="https://github.com/spencercnorton/xnote-placement">XNote Placement</a> ·
-  <a href="https://github.com/spencercnorton/snipsnap">SnipSnap</a> ·
-  <a href="https://github.com/spencercnorton/conductor">Conductor</a> ·
-  <a href="https://github.com/spencercnorton/norvi-os">NorviOS</a> ·
-  <a href="https://github.com/spencercnorton/indigo">Indigo</a> ·
-  <a href="https://github.com/spencercnorton/roadtrack">Road Track</a> ·
+  <a href="https://github.com/spencernorton/helios">Helios</a> ·
+  <a href="https://github.com/spencernorton/bitagent">BitAgent</a> ·
+  <a href="https://github.com/spencernorton/xnote">XNote</a> ·
+  <a href="https://github.com/spencernorton/xnote-placement">XNote Placement</a> ·
+  <a href="https://github.com/spencernorton/snipsnap">SnipSnap</a> ·
+  <a href="https://github.com/spencernorton/conductor">Conductor</a> ·
+  <a href="https://github.com/spencernorton/norvi-os">NorviOS</a> ·
+  <a href="https://github.com/spencernorton/indigo">Indigo</a> ·
+  <a href="https://github.com/spencernorton/roadtrack">Road Track</a> ·
   <a href="https://norvitech.com">norvitech.com</a>
 </p>
