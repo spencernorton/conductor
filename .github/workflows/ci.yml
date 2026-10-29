@@ -97,7 +97,9 @@ jobs:
             --source "$BUILD_SOURCE" --revision "$(git rev-parse HEAD)" --version "v$(tr -d '[:space:]' < VERSION)")
           test "$LOADED_ID" = "$CANDIDATE_ID"
           python3 scripts/test_tested_image.py out/tested-gpu
+          cp out/tested-gpu/receipt.json out/gpu-runtime/tested-image.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: success() && startsWith(github.ref, 'refs/tags/v')
         with:
           name: conductor-tested-gpu
           path: out/tested-gpu/
@@ -148,7 +150,9 @@ jobs:
             --source "$BUILD_SOURCE" --revision "$(git rev-parse HEAD)" --version "v$(tr -d '[:space:]' < VERSION)")
           test "$LOADED_ID" = "$CANDIDATE_ID"
           python3 scripts/test_tested_image.py out/tested-cpu
+          cp out/tested-cpu/receipt.json out/runtime/tested-image.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: success() && startsWith(github.ref, 'refs/tags/v')
         with:
           name: conductor-tested-cpu
           path: out/tested-cpu/
