@@ -67,9 +67,45 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - run: docker build -f Dockerfile.cuda --tag conductor:gpu-ci .
+      - name: Build the candidate with source identity
+        env:
+          BUILD_SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          COMMIT=$(git rev-parse HEAD)
+          BUILD_DATE=$(git show -s --format=%cI HEAD)
+          VERSION="v$(tr -d '[:space:]' < VERSION)"
+          docker build -f Dockerfile.cuda --build-arg COMMIT="$COMMIT" --build-arg BUILD_DATE="$BUILD_DATE" \
+            --label "org.opencontainers.image.source=$BUILD_SOURCE" \
+            --label "org.opencontainers.image.revision=$COMMIT" \
+            --label "org.opencontainers.image.version=$VERSION" --tag conductor:gpu-ci .
       - name: Start the GPU image and prove tuner video/audio without requiring a GPU
         run: python3 scripts/check_runtime.py --image conductor:gpu-ci --evidence out/gpu-runtime
+      - name: Export the exact runtime-qualified image
+        env:
+          BUILD_SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          python3 scripts/tested_image.py export --image conductor:gpu-ci \
+            --runtime out/gpu-runtime/runtime.json --dir out/tested-gpu \
+            --source "$BUILD_SOURCE" --revision "$(git rev-parse HEAD)" --version "v$(tr -d '[:space:]' < VERSION)"
+          CANDIDATE_ID=$(docker image inspect conductor:gpu-ci --format '{{.Id}}')
+          docker image rm conductor:gpu-ci
+          if docker image inspect "$CANDIDATE_ID" >/dev/null 2>&1; then
+            echo 'Candidate is still loaded; cannot prove a fresh archive import' >&2
+            exit 1
+          fi
+          LOADED_ID=$(python3 scripts/tested_image.py load --dir out/tested-gpu \
+            --source "$BUILD_SOURCE" --revision "$(git rev-parse HEAD)" --version "v$(tr -d '[:space:]' < VERSION)")
+          test "$LOADED_ID" = "$CANDIDATE_ID"
+          python3 scripts/test_tested_image.py out/tested-gpu
+          cp out/tested-gpu/receipt.json out/gpu-runtime/tested-image.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: success() && startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: conductor-tested-gpu
+          path: out/tested-gpu/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
@@ -84,9 +120,45 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - run: docker build --tag conductor:ci .
+      - name: Build the candidate with source identity
+        env:
+          BUILD_SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          COMMIT=$(git rev-parse HEAD)
+          BUILD_DATE=$(git show -s --format=%cI HEAD)
+          VERSION="v$(tr -d '[:space:]' < VERSION)"
+          docker build -f Dockerfile --build-arg COMMIT="$COMMIT" --build-arg BUILD_DATE="$BUILD_DATE" \
+            --label "org.opencontainers.image.source=$BUILD_SOURCE" \
+            --label "org.opencontainers.image.revision=$COMMIT" \
+            --label "org.opencontainers.image.version=$VERSION" --tag conductor:ci .
       - name: Prove packaged startup, API writes, tuning and restart persistence
         run: python3 scripts/check_runtime.py --image conductor:ci --evidence out/runtime
+      - name: Export the exact runtime-qualified image
+        env:
+          BUILD_SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          python3 scripts/tested_image.py export --image conductor:ci \
+            --runtime out/runtime/runtime.json --dir out/tested-cpu \
+            --source "$BUILD_SOURCE" --revision "$(git rev-parse HEAD)" --version "v$(tr -d '[:space:]' < VERSION)"
+          CANDIDATE_ID=$(docker image inspect conductor:ci --format '{{.Id}}')
+          docker image rm conductor:ci
+          if docker image inspect "$CANDIDATE_ID" >/dev/null 2>&1; then
+            echo 'Candidate is still loaded; cannot prove a fresh archive import' >&2
+            exit 1
+          fi
+          LOADED_ID=$(python3 scripts/tested_image.py load --dir out/tested-cpu \
+            --source "$BUILD_SOURCE" --revision "$(git rev-parse HEAD)" --version "v$(tr -d '[:space:]' < VERSION)")
+          test "$LOADED_ID" = "$CANDIDATE_ID"
+          python3 scripts/test_tested_image.py out/tested-cpu
+          cp out/tested-cpu/receipt.json out/runtime/tested-image.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: success() && startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: conductor-tested-cpu
+          path: out/tested-cpu/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:

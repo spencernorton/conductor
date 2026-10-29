@@ -15,3 +15,5 @@ docker-compose*.yml
 # The published tree ships the logo directory with only its README; keep it
 # in the build context so COPY assets/default-logos/ always has a source.
 !assets/default-logos/README.md
+
+/out/
