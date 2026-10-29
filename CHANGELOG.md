@@ -5,6 +5,9 @@ All notable changes to Conductor are recorded here. Versions follow
 
 ## Unreleased
 
+- Publish the exact runtime-tested container candidate, verifying its checksum,
+  source metadata and image ID instead of rebuilding after the tests.
+
 - Require both container variants to start, provision a disposable provider,
   tune and decode real synthetic video/audio, release leases and retain their
   identity and usable credentials after restart. Save runtime diagnostics on

@@ -73,3 +73,8 @@ paths. Fill it in — it is what the reviewer reads first.
 
 By contributing you agree that your contribution is licensed under the
 [MIT](LICENSE) that covers the project.
+
+Release CI exports each successful runtime candidate with its acceptance proof,
+archive checksum and immutable Docker image ID. The publisher downloads that
+candidate from the same workflow run and verifies its source revision, version,
+platform and identity before tagging and pushing it. It does not rebuild it.
