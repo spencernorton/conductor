@@ -5,6 +5,11 @@ All notable changes to Conductor are recorded here. Versions follow
 
 ## Unreleased
 
+- Require both container variants to start, provision a disposable provider,
+  tune and decode real synthetic video/audio, release leases and retain their
+  identity and usable credentials after restart. Save runtime diagnostics on
+  failure and clean up test resources.
+
 - Clarify the contribution workflow and guide references in the public documentation.
 
 - The commskip post-record stage now uses commskip-auto's batch API: it

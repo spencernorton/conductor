@@ -34,6 +34,16 @@ go test -race -count=1 ./...        # what CI runs
 go vet ./...        # lint; CI enforces it
 ```
 
+The required container checks start both built images with fresh PostgreSQL,
+exercise authenticated provider/credential/channel API writes, tune synthetic
+H.264/AAC video through the advertised tuner URL, decode the returned stream,
+and require the lease to release. A restart must preserve the device identity,
+channels and usable encrypted credentials. This uses the image's own FFmpeg
+and needs no external provider or GPU; hardware encoding is a separate check.
+Run `python3 scripts/check_runtime.py --image <candidate> --evidence out/runtime`
+locally after building an image. Each run removes its containers/volumes and
+saves logs, including on failure.
+
 - the HDHomeRun and XMLTV output shapes are contracts that Plex parses — change them only with a test that pins the exact bytes
 - Keep a change to one concern. A pull request that fixes a bug and
   reformats a file is two pull requests.

@@ -68,6 +68,14 @@ jobs:
         with:
           persist-credentials: false
       - run: docker build -f Dockerfile.cuda --tag conductor:gpu-ci .
+      - name: Start the GPU image and prove tuner video/audio without requiring a GPU
+        run: python3 scripts/check_runtime.py --image conductor:gpu-ci --evidence out/gpu-runtime
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: gpu-runtime-evidence
+          path: out/gpu-runtime/
+          retention-days: 14
   image:
     name: Public container build
     runs-on: ubuntu-24.04
@@ -77,3 +85,11 @@ jobs:
         with:
           persist-credentials: false
       - run: docker build --tag conductor:ci .
+      - name: Prove packaged startup, API writes, tuning and restart persistence
+        run: python3 scripts/check_runtime.py --image conductor:ci --evidence out/runtime
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: container-runtime-evidence
+          path: out/runtime/
+          retention-days: 14
