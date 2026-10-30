@@ -147,6 +147,10 @@ func main() {
 				logger.Error("conductor runtime ownership release failed", "err", err)
 			}
 		}()
+		runtimeOwner.OnReacquire = func(cause error, gap time.Duration) {
+			logger.Warn("conductor runtime ownership re-acquired after its session was lost",
+				"cause", cause, "gap", gap)
+		}
 		go func() {
 			err := runtimeOwner.Monitor(ctx, store.DefaultRuntimeSingletonCheckInterval)
 			if ctx.Err() != nil && errors.Is(err, context.Canceled) {
