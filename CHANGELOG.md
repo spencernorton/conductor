@@ -3,7 +3,9 @@
 All notable changes to Conductor are recorded here. Versions follow
 [semantic versioning](https://semver.org/); each release is a tag on `main`.
 
-## Unreleased
+## 0.61.0 — 2026-10-29
+
+This release also carries 0.60.2, which was versioned but never published.
 
 - Publish the exact runtime-tested container candidate, verifying its checksum,
   source metadata and image ID instead of rebuilding after the tests.
@@ -31,9 +33,6 @@ All notable changes to Conductor are recorded here. Versions follow
   Only a list that was read completely is judged, only airings the guide still
   shows, only recordings more than 15 minutes from their start, and a booking
   must go unclaimed for two consecutive cycles.
-
-## 0.60.2 — 2026-09-29
-
 - Remember a provider's black "off air" placeholder for a minute per upstream
   URL, shared by every stream pump. Retries, re-tunes and other viewers of an
   off-air channel inside that window reuse the verdict instead of sending
