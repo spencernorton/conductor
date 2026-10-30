@@ -104,6 +104,37 @@ func startupContext(ctx context.Context) (context.Context, context.CancelFunc, t
 	return startupCtx, cancel, deadline
 }
 
+// dvrStartupGrace mirrors the recorder's coverage tolerance: a recording whose
+// first byte lands later than this after its programme starts is rejected
+// anyway, so waiting longer for media cannot help it.
+const dvrStartupGrace = 5 * time.Second
+
+// maxDVRStartupWait bounds a recording's startup even when its programme
+// start is unexpectedly far away.
+const maxDVRStartupWait = time.Minute
+
+// writerStartupContext gives a recording until shortly after its programme
+// starts to get media, rather than the client budget a Plex tune gets. Nobody
+// waits on a recording the way Plex waits on a tune, and the recorder starts
+// before the programme, so retrying a refused or slow source in that time can
+// still capture the whole programme. Without a programme start (and for a
+// recording that starts late) the client budget applies.
+func writerStartupContext(ctx context.Context, programmeStart time.Time) (context.Context, context.CancelFunc) {
+	if programmeStart.IsZero() {
+		startupCtx, cancel, _ := startupContext(ctx)
+		return startupCtx, cancel
+	}
+	now := time.Now()
+	deadline := now.Add(ClientStartupBudget)
+	if grace := programmeStart.Add(dvrStartupGrace); grace.After(deadline) {
+		deadline = grace
+		if ceiling := now.Add(maxDVRStartupWait); deadline.After(ceiling) {
+			deadline = ceiling
+		}
+	}
+	return context.WithDeadline(ctx, deadline)
+}
+
 // sourceAttemptBudget preserves the configured per-source ceiling while also
 // consuming the one absolute client startup deadline. Once accepted media has
 // arrived, later reconnects return to the ordinary per-source timeout.

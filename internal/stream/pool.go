@@ -523,7 +523,7 @@ func (r *WriterReservation) ServeWithCoverage(
 
 	p := r.pool
 	lease := r.lease
-	startupCtx, cancelStartup, _ := startupContext(ctx)
+	startupCtx, cancelStartup := writerStartupContext(ctx, programmeStart)
 	defer cancelStartup()
 
 	s, chunks, unsubscribe, firstChunk, startErr := p.subscribeForStartup(
