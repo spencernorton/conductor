@@ -3,6 +3,14 @@
 All notable changes to Conductor are recorded here. Versions follow
 [semantic versioning](https://semver.org/); each release is a tag on `main`.
 
+## 0.61.1 — 2026-10-29
+
+- The TVmaze response cache works. The client stores its search and show
+  responses in the TVDb cache table under kinds that table's type did not
+  allow, so every read and write failed silently and nothing was ever cached.
+  Every enrichment pass re-queried TVmaze, and PostgreSQL logged about 4,000
+  errors a day. Migration 0028 adds the two kinds.
+
 ## 0.61.0 — 2026-10-29
 
 This release also carries 0.60.2, which was versioned but never published.
