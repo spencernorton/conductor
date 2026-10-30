@@ -1329,3 +1329,32 @@ func TestSubscriberStartupDeadlineWinsOverBufferedRealMedia(t *testing.T) {
 }
 
 var _ io.Reader = (*upstreamAttempt)(nil)
+
+func TestWriterStartupContextGivesRecordingsUntilTheProgrammeStarts(t *testing.T) {
+	deadlineOf := func(programmeStart time.Time) time.Duration {
+		ctx, cancel := writerStartupContext(context.Background(), programmeStart)
+		defer cancel()
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("startup context has no deadline")
+		}
+		return time.Until(deadline)
+	}
+	near := func(got, want time.Duration) bool { return got > want-time.Second && got <= want }
+
+	// A recorder starts 30 s before the programme: it may wait until 5 s after.
+	if got := deadlineOf(time.Now().Add(30 * time.Second)); !near(got, 30*time.Second+dvrStartupGrace) {
+		t.Fatalf("recording before its programme got %v of startup", got)
+	}
+	// A late start, or a plain writer, keeps the client budget.
+	if got := deadlineOf(time.Now().Add(-time.Minute)); !near(got, ClientStartupBudget) {
+		t.Fatalf("late recording got %v, want the client budget", got)
+	}
+	if got := deadlineOf(time.Time{}); !near(got, ClientStartupBudget) {
+		t.Fatalf("writer without a programme got %v, want the client budget", got)
+	}
+	// A programme start far away is capped.
+	if got := deadlineOf(time.Now().Add(time.Hour)); !near(got, maxDVRStartupWait) {
+		t.Fatalf("distant programme got %v, want the %v cap", got, maxDVRStartupWait)
+	}
+}

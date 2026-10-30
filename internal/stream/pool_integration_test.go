@@ -2720,3 +2720,58 @@ func TestIntegrationPoolRetuneReusesBlackPlaceholderVerdict(t *testing.T) {
 		t.Fatalf("provider placeholder downloads = %d across two tunes, want 1", got)
 	}
 }
+
+// refusingThenByteServer answers 503 until the given time, then streams like
+// byteServer: a source that is refused or not ready for a while.
+func refusingThenByteServer(t *testing.T, refuseUntil time.Time) (*httptest.Server, func()) {
+	t.Helper()
+	inner, stopInner := byteServer(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if time.Now().Before(refuseUntil) {
+			http.Error(w, "not yet", http.StatusServiceUnavailable)
+			return
+		}
+		inner.Config.Handler.ServeHTTP(w, r)
+	}))
+	return srv, func() { srv.CloseClientConnections(); srv.Close(); stopInner() }
+}
+
+// A recording starts before its programme and nobody waits on it the way Plex
+// waits on a tune. A source refused for longer than the client startup budget
+// must not lose a recording whose programme has not started yet.
+func TestIntegrationDVRStartupOutlastsClientBudgetBeforeProgramme(t *testing.T) {
+	db := freshStreamDB(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	began := time.Now()
+	upstream, stop := refusingThenByteServer(t, began.Add(stream.ClientStartupBudget+3*time.Second))
+	defer stop()
+	ch, _ := seedChannel(t, db, 1, upstream.URL)
+	pool := stream.NewPool(logger, db, store.PassthroughResolverForTest{})
+	defer pool.Close()
+
+	reservation, err := pool.ReserveWriter(context.Background(), ch.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var sink timestampCountingWriter
+	done := make(chan error, 1)
+	programmeStart := began.Add(30 * time.Second)
+	go func() {
+		_, _, serveErr := reservation.ServeWithCoverage(ctx, &sink, programmeStart, programmeStart.Add(time.Hour))
+		done <- serveErr
+	}()
+	for sink.lastAt.Load() == 0 {
+		select {
+		case serveErr := <-done:
+			t.Fatalf("recording gave up after %v: %v", time.Since(began).Round(time.Second), serveErr)
+		case <-time.After(100 * time.Millisecond):
+		}
+		if time.Since(began) > 40*time.Second {
+			t.Fatal("no media within the programme's startup window")
+		}
+	}
+	cancel()
+	<-done
+}
