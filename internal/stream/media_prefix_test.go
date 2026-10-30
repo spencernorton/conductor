@@ -1859,3 +1859,60 @@ func TestStartupMediaGateSlowProbesDoNotRepeatOnEveryChunk(t *testing.T) {
 			validator.calls)
 	}
 }
+
+// A high-bitrate, long-GOP feed joined mid-GOP puts its first keyframe and
+// codec configuration several MB into the prefix. ffprobe's default
+// -probesize (5 MB) stops looking for that configuration before it arrives,
+// reports empty extradata, and the gate refused the attempt on every probe
+// until its 16 MiB cap.
+func TestFFprobeMediaPrefixFindsConfigurationBeyondDefaultProbeSize(t *testing.T) {
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatal("ffmpeg missing from supported CI image")
+		}
+		t.Skip("ffmpeg not on PATH")
+	}
+	ffprobe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatal("ffprobe missing from supported CI image")
+		}
+		t.Skip("ffprobe not on PATH")
+	}
+	// 16 Mbps CBR with filler and one keyframe every 4 s: ~8 MB per GOP.
+	cmd := exec.Command(ffmpeg,
+		"-hide_banner", "-loglevel", "error", "-nostdin",
+		"-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=10",
+		"-f", "lavfi", "-i", "sine=sample_rate=48000:duration=10",
+		"-c:v", "libx264", "-preset", "ultrafast",
+		"-g", "120", "-keyint_min", "120", "-sc_threshold", "0",
+		"-b:v", "16M", "-minrate", "16M", "-maxrate", "16M", "-bufsize", "16M",
+		"-x264-params", "nal-hrd=cbr",
+		"-c:a", "aac", "-f", "mpegts", "pipe:1")
+	media, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("generate long-GOP fixture: %v", err)
+	}
+	// Join 1 MB in, aligned to a TS packet: the next keyframe is ~7 MB away.
+	start := (1 << 20) / tsPacketSize * tsPacketSize
+	end := start + 12<<20
+	if len(media) < end {
+		t.Fatalf("fixture too small: %d bytes", len(media))
+	}
+	window := media[start:end]
+	if pos := bytes.Index(window, []byte{0, 0, 0, 1, 0x67}); pos >= 0 && pos < 5_000_000 {
+		t.Fatalf("fixture places an SPS %d bytes in; the test needs it past 5 MB", pos)
+	}
+
+	validator := &ffprobeMediaPrefixValidator{ffprobeBinary: ffprobe, available: true}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultSourceStartupTimeout)
+	defer cancel()
+	decision, err := validator.Validate(ctx, window)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.kind != prefixReady {
+		t.Fatalf("decision=%v reason=%q; want ready once the keyframe is buffered", decision.kind, decision.reason)
+	}
+}

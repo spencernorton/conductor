@@ -310,6 +310,10 @@ func (v *ffprobeMediaPrefixValidator) probe(ctx context.Context, data []byte) (p
 	}
 	cmd := exec.CommandContext(ctx, v.ffprobeBinary,
 		"-hide_banner", "-loglevel", "error",
+		// Look for codec configuration across the whole buffered prefix. With
+		// the defaults (5 MB / 5 s) a high-bitrate, long-GOP feed joined
+		// mid-GOP reported empty extradata until the gate's cap.
+		"-probesize", strconv.Itoa(len(data)), "-analyzeduration", "30000000",
 		"-select_streams", "v:0", "-show_data",
 		"-show_streams", "-show_frames",
 		"-show_entries", "stream=index,id,codec_name,codec_type,extradata,extradata_size:frame=stream_index,key_frame,pkt_pos,best_effort_timestamp_time",
