@@ -7,11 +7,27 @@
 
 <p align="center">
   <a href="https://norvitech.com"><img alt="NorviTech Suite" src="https://img.shields.io/badge/NorviTech-Suite-FD8024.svg"></a>
-  <a href="https://github.com/spencernorton/conductor/tags"><img alt="Latest release" src="https://img.shields.io/github/v/tag/spencercnorton/conductor?label=release&sort=semver"></a>
+  <a href="https://github.com/spencernorton/conductor/tags"><img alt="Latest release" src="https://img.shields.io/github/v/tag/spencernorton/conductor?label=release&sort=semver"></a>
   <a href="#install"><img alt="Docker Compose" src="https://img.shields.io/badge/install-docker%20compose-2496ed.svg?logo=docker&logoColor=white"></a>
   <a href="LICENSE"><img alt="Licence" src="https://img.shields.io/badge/licence-MIT-blue.svg"></a>
   <a href="https://buy.stripe.com/8x26oH2U44f65TRe574wM04"><img alt="Donate" src="https://img.shields.io/badge/donate-Stripe-635bff.svg?logo=stripe&logoColor=white"></a>
 </p>
+
+```mermaid
+flowchart LR
+    Provider[Your IPTV providers] --> Slots[Per-credential stream slots]
+    Slots --> Tuner[Conductor HDHomeRun tuner]
+    Guide[XMLTV and optional metadata] --> Tuner
+    DB[(PostgreSQL state)] <--> Tuner
+    Tuner --> Plex[Plex Live TV and DVR]
+    Plex --> View[Watch or record]
+```
+
+Plex discovers a network tuner, receives Conductor's channel lineup and guide,
+and tunes a stream through the provider slot pool. Conductor passes video
+through; Plex handles playback and recording.
+
+
 
 Conductor presents itself to Plex as a SiliconDust HDHomeRun tuner and serves
 live channels from the IPTV subscriptions you already pay for. It is for
