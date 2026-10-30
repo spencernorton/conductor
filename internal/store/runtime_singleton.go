@@ -13,12 +13,21 @@ import (
 const (
 	runtimeSingletonLockName = "conductor:runtime-singleton"
 
-	// DefaultRuntimeSingletonCheckInterval bounds how long a process can keep
-	// serving after PostgreSQL has dropped the session that owns the runtime
-	// lock. The caller must terminate the service when Monitor returns an
-	// error; reconnecting would otherwise permit split-brain ownership.
+	// DefaultRuntimeSingletonCheckInterval is how often Monitor proves that the
+	// session owning the runtime lock is alive. The caller must terminate the
+	// service when Monitor returns an error.
 	DefaultRuntimeSingletonCheckInterval = time.Second
-	runtimeSingletonProbeTimeout         = time.Second
+	// runtimeSingletonProbeTimeout tolerates a host stall that delays a single
+	// round trip. pgx closes a connection whose read times out, which ends the
+	// session and releases the lock, so a timed-out probe leads to reacquire.
+	runtimeSingletonProbeTimeout = 5 * time.Second
+	// runtimeSingletonReacquireWindow bounds how long a runtime keeps serving
+	// after its lock session ended, while it tries to win the lock back on a
+	// new session. Live streams keep flowing meanwhile; they do not need the
+	// database. A memory stall on the host has ended the session this way
+	// while nothing else was wrong.
+	runtimeSingletonReacquireWindow  = time.Minute
+	runtimeSingletonReacquireBackoff = time.Second
 )
 
 // ErrRuntimeAlreadyActive means another Conductor process owns this database.
@@ -31,7 +40,13 @@ var ErrRuntimeAlreadyActive = errors.New("another conductor runtime is active")
 // pooled connection. It must be acquired before startup reconciliation and
 // held until all process-local stream pumps and workers have stopped.
 type RuntimeSingleton struct {
+	// OnReacquire, when set before Monitor starts, is called after a lost lock
+	// session has been replaced, with the probe error and how long ownership
+	// was unproven.
+	OnReacquire func(cause error, gap time.Duration)
+
 	mu         sync.Mutex
+	pool       *pgxpool.Pool
 	conn       *pgxpool.Conn
 	backendPID int32
 	closed     bool
@@ -44,31 +59,51 @@ func (db *DB) AcquireRuntimeSingleton(ctx context.Context) (*RuntimeSingleton, e
 	if db == nil || db.Pool == nil {
 		return nil, errors.New("db not open")
 	}
-	conn, err := db.Pool.Acquire(ctx)
+	conn, backendPID, err := tryRuntimeLock(ctx, db.Pool)
 	if err != nil {
-		return nil, fmt.Errorf("acquire runtime singleton connection: %w", err)
+		return nil, err
 	}
+	return &RuntimeSingleton{pool: db.Pool, conn: conn, backendPID: backendPID}, nil
+}
 
+// tryRuntimeLock takes the runtime lock on a fresh pooled session. The
+// connection is returned only when its session now owns the lock.
+func tryRuntimeLock(ctx context.Context, pool *pgxpool.Pool) (*pgxpool.Conn, int32, error) {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("acquire runtime singleton connection: %w", err)
+	}
 	var acquired bool
 	var backendPID int32
 	err = conn.QueryRow(ctx, `
 		SELECT pg_try_advisory_lock(hashtextextended($1, 0)),
 		       pg_backend_pid()`, runtimeSingletonLockName).Scan(&acquired, &backendPID)
 	if err != nil {
-		conn.Release()
-		return nil, fmt.Errorf("acquire runtime singleton lock: %w", err)
+		// The lock may have been granted before the error: never pool it.
+		discardRuntimeConn(conn)
+		return nil, 0, fmt.Errorf("acquire runtime singleton lock: %w", err)
 	}
 	if !acquired {
 		conn.Release()
-		return nil, ErrRuntimeAlreadyActive
+		return nil, 0, ErrRuntimeAlreadyActive
 	}
-	return &RuntimeSingleton{conn: conn, backendPID: backendPID}, nil
+	return conn, backendPID, nil
+}
+
+// discardRuntimeConn closes a session that may hold the runtime lock instead
+// of returning it to the pool, where an idle connection could keep the lock.
+func discardRuntimeConn(conn *pgxpool.Conn) {
+	raw := conn.Hijack()
+	closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_ = raw.Close(closeCtx)
+	cancel()
 }
 
 // Monitor verifies that the exact PostgreSQL session owning the advisory lock
 // remains alive. A pgxpool.Conn cannot transparently swap its underlying
 // session while acquired; checking the backend PID also makes that invariant
-// explicit. Any error while ctx remains live is fatal to runtime ownership.
+// explicit. When the probe fails, Monitor wins the lock back on a new session
+// (see reacquire) and returns an error only when that is impossible.
 func (s *RuntimeSingleton) Monitor(ctx context.Context, interval time.Duration) error {
 	if interval <= 0 {
 		interval = DefaultRuntimeSingletonCheckInterval
@@ -83,9 +118,77 @@ func (s *RuntimeSingleton) Monitor(ctx context.Context, interval time.Duration) 
 			probeCtx, cancel := context.WithTimeout(ctx, runtimeSingletonProbeTimeout)
 			err := s.check(probeCtx)
 			cancel()
-			if err != nil {
-				return err
+			if err == nil {
+				continue
 			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			lost := time.Now()
+			if rerr := s.reacquire(ctx, lost.Add(runtimeSingletonReacquireWindow)); rerr != nil {
+				return errors.Join(err, rerr)
+			}
+			if s.OnReacquire != nil {
+				s.OnReacquire(err, time.Since(lost))
+			}
+		}
+	}
+}
+
+// reacquire replaces a lock session that failed its probe. The old session is
+// closed first, so its backend exits and Postgres releases the lock. Until that
+// backend has gone, a held lock may still be its own, so the attempt is
+// retried. Once it has gone, a lock that stays held on two consecutive
+// attempts belongs to another runtime, and ownership is lost.
+//
+// Known gap: a runtime that takes and releases the lock entirely inside the
+// window goes unnoticed. Only one Conductor runs per database in practice.
+func (s *RuntimeSingleton) reacquire(ctx context.Context, deadline time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("runtime singleton is closed")
+	}
+	if s.conn != nil {
+		discardRuntimeConn(s.conn)
+		s.conn = nil
+	}
+	oldPID := s.backendPID
+	heldByOther := false
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, runtimeSingletonProbeTimeout)
+		var oldAlive bool
+		err := s.pool.QueryRow(attemptCtx,
+			`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)`, oldPID).Scan(&oldAlive)
+		if err == nil {
+			var conn *pgxpool.Conn
+			var pid int32
+			conn, pid, err = tryRuntimeLock(attemptCtx, s.pool)
+			if err == nil {
+				cancel()
+				s.conn, s.backendPID = conn, pid
+				return nil
+			}
+		}
+		cancel()
+		if errors.Is(err, ErrRuntimeAlreadyActive) && !oldAlive {
+			if heldByOther {
+				return ErrRuntimeAlreadyActive
+			}
+			heldByOther = true
+		} else {
+			heldByOther = false
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Now().Add(runtimeSingletonReacquireBackoff).After(deadline) {
+			return fmt.Errorf("reacquire runtime singleton within %s: %w", runtimeSingletonReacquireWindow, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(runtimeSingletonReacquireBackoff):
 		}
 	}
 }

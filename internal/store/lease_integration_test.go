@@ -142,35 +142,41 @@ func TestIntegrationRuntimeSingletonExcludesAndReacquires(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reacquire runtime singleton: %v", err)
 	}
+	// Release even when an assertion fails; the pool's Close waits for it.
+	t.Cleanup(func() { _ = reacquired.Close(context.Background()) })
 
+	// Losing the lock session (a host stall times the probe out the same way)
+	// must not end the runtime: Monitor wins the lock back on a new session.
+	regained := make(chan time.Duration, 1)
+	reacquired.OnReacquire = func(_ error, gap time.Duration) { regained <- gap }
+	monitorCtx, stopMonitor := context.WithCancel(ctx)
 	monitorDone := make(chan error, 1)
-	go func() { monitorDone <- reacquired.Monitor(ctx, 10*time.Millisecond) }()
-	var ownerPID int32
-	if err := db.Pool.QueryRow(ctx, `
-		SELECT pid
-		  FROM pg_locks
-		 WHERE locktype = 'advisory' AND granted
-		   AND pid <> pg_backend_pid()
-		 ORDER BY pid
-		 LIMIT 1`).Scan(&ownerPID); err != nil {
-		t.Fatalf("find runtime singleton backend: %v", err)
-	}
-	var terminated bool
-	if err := db.Pool.QueryRow(ctx,
-		`SELECT pg_terminate_backend($1)`, ownerPID).Scan(&terminated); err != nil || !terminated {
-		t.Fatalf("terminate runtime singleton backend: terminated=%v err=%v", terminated, err)
-	}
+	go func() { monitorDone <- reacquired.Monitor(monitorCtx, 10*time.Millisecond) }()
+	ownerPID := runtimeLockOwnerPID(t, db)
+	terminateBackend(t, db, ownerPID)
 	select {
+	case <-regained:
 	case err := <-monitorDone:
-		if err == nil || !strings.Contains(err.Error(), "runtime singleton connection lost") {
-			t.Fatalf("monitor loss err=%v, want connection-lost error", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("runtime singleton monitor did not promptly detect session loss")
+		t.Fatalf("monitor ended after its session was lost, err=%v; want reacquire", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("runtime singleton monitor did not reacquire after session loss")
 	}
-	// Close must discard the broken dedicated connection. Session termination
-	// already released the advisory lock, so another owner can then acquire.
-	_ = reacquired.Close(ctx)
+	if newPID := runtimeLockOwnerPID(t, db); newPID == ownerPID {
+		t.Fatalf("lock still held by terminated backend %d", ownerPID)
+	}
+	if second, err := db.AcquireRuntimeSingleton(ctx); !errors.Is(err, store.ErrRuntimeAlreadyActive) {
+		if second != nil {
+			_ = second.Close(ctx)
+		}
+		t.Fatalf("acquire beside a reacquired owner err=%v, want ErrRuntimeAlreadyActive", err)
+	}
+	stopMonitor()
+	if err := <-monitorDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("monitor stop err=%v, want context.Canceled", err)
+	}
+	if err := reacquired.Close(ctx); err != nil {
+		t.Fatalf("release reacquired runtime singleton: %v", err)
+	}
 	finalOwner, err := db.AcquireRuntimeSingleton(ctx)
 	if err != nil {
 		t.Fatalf("acquire after owner session loss: %v", err)
@@ -178,6 +184,91 @@ func TestIntegrationRuntimeSingletonExcludesAndReacquires(t *testing.T) {
 	if err := finalOwner.Close(ctx); err != nil {
 		t.Fatalf("release final runtime singleton: %v", err)
 	}
+}
+
+// If another session takes the lock while the owner's session is gone, the
+// owner must give up rather than serve beside a second runtime.
+func TestIntegrationRuntimeSingletonYieldsToAnotherOwner(t *testing.T) {
+	db := freshDB(t)
+	ctx := context.Background()
+
+	owner, err := db.AcquireRuntimeSingleton(ctx)
+	if err != nil {
+		t.Fatalf("acquire runtime singleton: %v", err)
+	}
+	t.Cleanup(func() { _ = owner.Close(context.Background()) })
+	ownerPID := runtimeLockOwnerPID(t, db)
+
+	// A rival blocks on the same lock, so Postgres hands it over the moment
+	// the owner's backend exits, ahead of the owner's own reacquire.
+	rival, err := db.Pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire rival connection: %v", err)
+	}
+	defer func() { _ = rival.Hijack().Close(context.Background()) }()
+	rivalLocked := make(chan error, 1)
+	go func() {
+		_, err := rival.Exec(ctx,
+			`SELECT pg_advisory_lock(hashtextextended('conductor:runtime-singleton', 0))`)
+		rivalLocked <- err
+	}()
+	waitForLockWaiter(t, db)
+
+	monitorDone := make(chan error, 1)
+	go func() { monitorDone <- owner.Monitor(ctx, 10*time.Millisecond) }()
+	terminateBackend(t, db, ownerPID)
+	if err := <-rivalLocked; err != nil {
+		t.Fatalf("rival lock: %v", err)
+	}
+	select {
+	case err := <-monitorDone:
+		if !errors.Is(err, store.ErrRuntimeAlreadyActive) {
+			t.Fatalf("monitor err=%v, want ErrRuntimeAlreadyActive", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("owner kept serving after another session took the runtime lock")
+	}
+}
+
+func runtimeLockOwnerPID(t *testing.T, db *store.DB) int32 {
+	t.Helper()
+	var pid int32
+	if err := db.Pool.QueryRow(context.Background(), `
+		SELECT pid
+		  FROM pg_locks
+		 WHERE locktype = 'advisory' AND granted
+		   AND pid <> pg_backend_pid()
+		 ORDER BY pid
+		 LIMIT 1`).Scan(&pid); err != nil {
+		t.Fatalf("find runtime singleton backend: %v", err)
+	}
+	return pid
+}
+
+func terminateBackend(t *testing.T, db *store.DB, pid int32) {
+	t.Helper()
+	var terminated bool
+	if err := db.Pool.QueryRow(context.Background(),
+		`SELECT pg_terminate_backend($1)`, pid).Scan(&terminated); err != nil || !terminated {
+		t.Fatalf("terminate backend %d: terminated=%v err=%v", pid, terminated, err)
+	}
+}
+
+func waitForLockWaiter(t *testing.T, db *store.DB) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting bool
+		if err := db.Pool.QueryRow(context.Background(), `
+			SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)`).Scan(&waiting); err != nil {
+			t.Fatalf("look for advisory lock waiter: %v", err)
+		}
+		if waiting {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("rival never queued on the runtime lock")
 }
 
 // seedProviderWithCredentials creates one provider with N credentials each

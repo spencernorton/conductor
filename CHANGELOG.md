@@ -5,6 +5,14 @@ All notable changes to Conductor are recorded here. Versions follow
 
 ## 0.61.1 — 2026-10-29
 
+- A lost runtime-lock session no longer stops Conductor. The lock's session
+  can end because PostgreSQL is briefly unreachable, or because a host memory
+  stall times out the 1-second probe, which makes the driver close the
+  connection. Conductor now wins the lock back on a new session within a
+  minute, and live streams keep playing while it does. It still stops when
+  another runtime holds the lock or the database stays unreachable for the
+  whole minute. The probe timeout rises from 1 to 5 seconds. A re-acquire is
+  logged as a warning with its cause and gap.
 - The TVmaze response cache works. The client stores its search and show
   responses in the TVDb cache table under kinds that table's type did not
   allow, so every read and write failed silently and nothing was ever cached.
