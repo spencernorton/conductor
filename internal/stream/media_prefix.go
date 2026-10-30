@@ -155,9 +155,12 @@ func (g *startupMediaGate) PushFinal(ctx context.Context, p []byte) ([]byte, boo
 }
 
 func (g *startupMediaGate) validate(ctx context.Context, final bool) ([]byte, bool, error) {
-	g.lastProbe = time.Now()
 	g.nextProbe = len(g.buffer) + prefixProbeByteStep
 	decision, err := g.validator.Validate(ctx, g.buffer)
+	// The interval counts from the end of a probe. Counted from its start, a
+	// probe slower than the interval made every following read re-probe the
+	// whole buffer.
+	g.lastProbe = time.Now()
 	if err != nil {
 		g.completed = time.Now()
 		return nil, false, err
