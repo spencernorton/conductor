@@ -1827,3 +1827,35 @@ func testAdaptationOnlyDiscontinuity(pid int, continuity byte) []byte {
 	packet[5] = 0x80
 	return packet
 }
+
+// slowNeedMoreValidator stands in for an ffprobe run that takes longer than
+// the probe interval, as a whole-buffer probe does once the prefix is large.
+type slowNeedMoreValidator struct {
+	delay time.Duration
+	calls int
+}
+
+func (v *slowNeedMoreValidator) Validate(ctx context.Context, _ []byte) (prefixDecision, error) {
+	v.calls++
+	time.Sleep(v.delay)
+	return prefixDecision{kind: prefixNeedMore, reason: "test_buffering"}, nil
+}
+
+// The probe interval must count from the end of a probe. Counted from its
+// start, a probe slower than the interval made every following 64 KiB read
+// re-probe the whole buffer, so a burst of reads crawled one chunk per probe.
+// That starved a recording attaching to a running pump until it was dropped.
+func TestStartupMediaGateSlowProbesDoNotRepeatOnEveryChunk(t *testing.T) {
+	validator := &slowNeedMoreValidator{delay: prefixProbeInterval + 100*time.Millisecond}
+	gate := newStartupMediaGate(validator)
+	chunk := make([]byte, minPrefixDecisionBytes)
+	for i := 0; i < 8; i++ { // 512 KiB arriving back to back, well under one byte step
+		if _, ready, err := gate.Push(context.Background(), chunk); err != nil || ready {
+			t.Fatalf("push %d: ready=%v err=%v", i, ready, err)
+		}
+	}
+	if validator.calls > 1 {
+		t.Fatalf("%d probes for 8 back-to-back reads; want 1 (slow probes must not re-run on every read)",
+			validator.calls)
+	}
+}
