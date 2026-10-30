@@ -22,6 +22,7 @@ import (
 	"github.com/spencercnorton/conductor/internal/testdb"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -148,8 +149,14 @@ func TestIntegrationRuntimeSingletonExcludesAndReacquires(t *testing.T) {
 	// Losing the lock session (a host stall times the probe out the same way)
 	// must not end the runtime: Monitor wins the lock back on a new session.
 	regained := make(chan time.Duration, 1)
-	reacquired.OnReacquire = func(_ error, gap time.Duration) { regained <- gap }
+	reacquired.OnReacquire = func(_ error, gap time.Duration) {
+		select {
+		case regained <- gap:
+		default:
+		}
+	}
 	monitorCtx, stopMonitor := context.WithCancel(ctx)
+	t.Cleanup(stopMonitor)
 	monitorDone := make(chan error, 1)
 	go func() { monitorDone <- reacquired.Monitor(monitorCtx, 10*time.Millisecond) }()
 	ownerPID := runtimeLockOwnerPID(t, db)
@@ -205,17 +212,26 @@ func TestIntegrationRuntimeSingletonYieldsToAnotherOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire rival connection: %v", err)
 	}
-	defer func() { _ = rival.Hijack().Close(context.Background()) }()
+	rivalCtx, stopRival := context.WithCancel(ctx)
 	rivalLocked := make(chan error, 1)
+	rivalDone := make(chan struct{})
 	go func() {
-		_, err := rival.Exec(ctx,
+		defer close(rivalDone)
+		_, err := rival.Exec(rivalCtx,
 			`SELECT pg_advisory_lock(hashtextextended('conductor:runtime-singleton', 0))`)
 		rivalLocked <- err
 	}()
+	t.Cleanup(func() {
+		stopRival()
+		<-rivalDone
+		_ = rival.Hijack().Close(context.Background())
+	})
 	waitForLockWaiter(t, db)
 
+	monitorCtx, stopMonitor := context.WithCancel(ctx)
+	t.Cleanup(stopMonitor)
 	monitorDone := make(chan error, 1)
-	go func() { monitorDone <- owner.Monitor(ctx, 10*time.Millisecond) }()
+	go func() { monitorDone <- owner.Monitor(monitorCtx, 10*time.Millisecond) }()
 	terminateBackend(t, db, ownerPID)
 	if err := <-rivalLocked; err != nil {
 		t.Fatalf("rival lock: %v", err)
@@ -227,6 +243,54 @@ func TestIntegrationRuntimeSingletonYieldsToAnotherOwner(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("owner kept serving after another session took the runtime lock")
+	}
+}
+
+// A host stall can freeze the lock's backend rather than end it. The probe
+// times out while that backend still holds the lock, so the owner must keep
+// retrying until it exits, not report another runtime. SIGSTOP needs the
+// container this harness started, so a CONDUCTOR_TEST_DSN database skips it.
+func TestIntegrationRuntimeSingletonWaitsOutAStalledBackend(t *testing.T) {
+	if os.Getenv("CONDUCTOR_TEST_DSN") != "" {
+		t.Skip("stalling a backend needs the harness's own container")
+	}
+	db := freshDB(t)
+	ctx := context.Background()
+	owner, err := db.AcquireRuntimeSingleton(ctx)
+	if err != nil {
+		t.Fatalf("acquire runtime singleton: %v", err)
+	}
+	t.Cleanup(func() { _ = owner.Close(context.Background()) })
+	regained := make(chan time.Duration, 1)
+	owner.OnReacquire = func(_ error, gap time.Duration) {
+		select {
+		case regained <- gap:
+		default:
+		}
+	}
+	monitorCtx, stopMonitor := context.WithCancel(ctx)
+	t.Cleanup(stopMonitor)
+	monitorDone := make(chan error, 1)
+	go func() { monitorDone <- owner.Monitor(monitorCtx, 100*time.Millisecond) }()
+
+	pid := strconv.Itoa(int(runtimeLockOwnerPID(t, db)))
+	signal := func(sig string) error {
+		return exec.Command("docker", "exec", pgContainerName, "kill", "-"+sig, pid).Run()
+	}
+	if err := signal("STOP"); err != nil {
+		t.Fatalf("stop lock backend: %v", err)
+	}
+	resume := time.AfterFunc(9*time.Second, func() { _ = signal("CONT") })
+	t.Cleanup(func() { resume.Stop(); _ = signal("CONT") })
+	select {
+	case gap := <-regained:
+		if gap < 9*time.Second {
+			t.Fatalf("reacquired after %v, before the stalled backend resumed", gap)
+		}
+	case err := <-monitorDone:
+		t.Fatalf("monitor ended while its own backend was stalled: %v", err)
+	case <-time.After(40 * time.Second):
+		t.Fatal("no reacquire after the stalled backend resumed")
 	}
 }
 

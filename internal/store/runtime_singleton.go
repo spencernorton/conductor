@@ -67,7 +67,9 @@ func (db *DB) AcquireRuntimeSingleton(ctx context.Context) (*RuntimeSingleton, e
 }
 
 // tryRuntimeLock takes the runtime lock on a fresh pooled session. The
-// connection is returned only when its session now owns the lock.
+// connection is returned only when its session now owns the lock. When the
+// lock query fails, the returned PID names the discarded session, which may
+// hold the lock until its teardown reaches PostgreSQL.
 func tryRuntimeLock(ctx context.Context, pool *pgxpool.Pool) (*pgxpool.Conn, int32, error) {
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
@@ -80,8 +82,9 @@ func tryRuntimeLock(ctx context.Context, pool *pgxpool.Pool) (*pgxpool.Conn, int
 		       pg_backend_pid()`, runtimeSingletonLockName).Scan(&acquired, &backendPID)
 	if err != nil {
 		// The lock may have been granted before the error: never pool it.
+		pid := int32(conn.Conn().PgConn().PID())
 		discardRuntimeConn(conn)
-		return nil, 0, fmt.Errorf("acquire runtime singleton lock: %w", err)
+		return nil, pid, fmt.Errorf("acquire runtime singleton lock: %w", err)
 	}
 	if !acquired {
 		conn.Release()
@@ -110,36 +113,44 @@ func (s *RuntimeSingleton) Monitor(ctx context.Context, interval time.Duration) 
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	lastOK := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			probeCtx, cancel := context.WithTimeout(ctx, runtimeSingletonProbeTimeout)
+			// A shutdown must not cancel an in-flight probe: pgx would close the
+			// session and release the lock before the stream pumps have stopped.
+			probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runtimeSingletonProbeTimeout)
 			err := s.check(probeCtx)
 			cancel()
 			if err == nil {
+				lastOK = time.Now()
 				continue
 			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			lost := time.Now()
-			if rerr := s.reacquire(ctx, lost.Add(runtimeSingletonReacquireWindow)); rerr != nil {
+			// The window and the reported gap both count from the last proof of
+			// ownership, which is up to a probe timeout before the failure.
+			if rerr := s.reacquire(ctx, lastOK.Add(runtimeSingletonReacquireWindow)); rerr != nil {
 				return errors.Join(err, rerr)
 			}
 			if s.OnReacquire != nil {
-				s.OnReacquire(err, time.Since(lost))
+				s.OnReacquire(err, time.Since(lastOK))
 			}
+			lastOK = time.Now()
 		}
 	}
 }
 
 // reacquire replaces a lock session that failed its probe. The old session is
-// closed first, so its backend exits and Postgres releases the lock. Until that
-// backend has gone, a held lock may still be its own, so the attempt is
-// retried. Once it has gone, a lock that stays held on two consecutive
-// attempts belongs to another runtime, and ownership is lost.
+// closed first, so its backend exits and Postgres releases the lock. While any
+// of our sessions still exists (the old one, or an attempt whose reply was
+// lost after the lock was granted), a held lock may be our own, so the attempt
+// is retried. Once none exists, a held lock belongs to another runtime and
+// ownership is lost: Postgres releases a backend's advisory locks before its
+// pg_stat_activity row disappears.
 //
 // Known gap: a runtime that takes and releases the lock entirely inside the
 // window goes unnoticed. Only one Conductor runs per database in practice.
@@ -153,13 +164,12 @@ func (s *RuntimeSingleton) reacquire(ctx context.Context, deadline time.Time) er
 		discardRuntimeConn(s.conn)
 		s.conn = nil
 	}
-	oldPID := s.backendPID
-	heldByOther := false
+	ours := []int32{s.backendPID}
 	for {
 		attemptCtx, cancel := context.WithTimeout(ctx, runtimeSingletonProbeTimeout)
-		var oldAlive bool
+		var oursAlive bool
 		err := s.pool.QueryRow(attemptCtx,
-			`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)`, oldPID).Scan(&oldAlive)
+			`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = ANY($1))`, ours).Scan(&oursAlive)
 		if err == nil {
 			var conn *pgxpool.Conn
 			var pid int32
@@ -169,15 +179,13 @@ func (s *RuntimeSingleton) reacquire(ctx context.Context, deadline time.Time) er
 				s.conn, s.backendPID = conn, pid
 				return nil
 			}
+			if pid != 0 {
+				ours = append(ours, pid)
+			}
 		}
 		cancel()
-		if errors.Is(err, ErrRuntimeAlreadyActive) && !oldAlive {
-			if heldByOther {
-				return ErrRuntimeAlreadyActive
-			}
-			heldByOther = true
-		} else {
-			heldByOther = false
+		if errors.Is(err, ErrRuntimeAlreadyActive) && !oursAlive {
+			return ErrRuntimeAlreadyActive
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
