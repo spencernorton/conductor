@@ -3,6 +3,22 @@
 All notable changes to Conductor are recorded here. Versions follow
 [semantic versioning](https://semver.org/); each release is a tag on `main`.
 
+## 0.61.2 — 2026-10-30
+
+- A recording gets until shortly after its programme starts to receive
+  media, not the 9 seconds a Plex tune gets. The recorder starts before the
+  programme and nobody waits on it, so a source that is refused or slow for a
+  few seconds no longer loses the whole recording with "upstream did not
+  start in time".
+- The startup gate's probe interval counts from the end of a probe. When a
+  whole-buffer probe took longer than the interval, every following read
+  started another probe, which starved a recording attaching to a running
+  stream until it was disconnected.
+- The startup gate's ffprobe searches the whole buffered prefix for codec
+  configuration. A high-bitrate, long-GOP feed joined mid-GOP carries its
+  parameter sets past ffprobe's default 5 MB probe window and was refused
+  with `codec_configuration_missing` on every probe.
+
 ## 0.61.1 — 2026-10-29
 
 - A lost runtime-lock session no longer stops Conductor. The lock's session
