@@ -11,7 +11,7 @@ provider must authorize the channels and concurrent streams you configure.
 Plex must be able to reach the advertised Conductor URL.
 
 ```bash
-git clone https://github.com/spencercnorton/conductor.git
+git clone https://github.com/spencernorton/conductor.git
 cd conductor
 cp .env.example .env
 openssl rand -hex 32   # POSTGRES_PASSWORD
