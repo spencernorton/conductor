@@ -69,7 +69,7 @@ func NewPosterWorker(logger *slog.Logger, s PosterWorkerStore, assets *poster.As
 		RemoteHTTP: newPublicPosterHTTPClient(),
 		// Scan the full normal 14-day guide window. A small LIMIT can permanently
 		// starve later researched matches behind recurring ad/idle rows.
-		Interval: 10 * time.Minute, BatchSize: 20000, MaxGenerationsPerPass: 1,
+		Interval: time.Hour, BatchSize: 20000, MaxGenerationsPerPass: 6,
 		wake: make(chan struct{}, 1),
 	}
 }
@@ -77,7 +77,7 @@ func NewPosterWorker(logger *slog.Logger, s PosterWorkerStore, assets *poster.As
 func (w *PosterWorker) Run(ctx context.Context) {
 	interval := w.Interval
 	if interval <= 0 {
-		interval = 10 * time.Minute
+		interval = time.Hour
 	}
 	w.Logger.Info("poster worker starting", "interval", interval,
 		"generation_enabled", w.Generator != nil)

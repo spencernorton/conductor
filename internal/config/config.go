@@ -233,9 +233,10 @@ type Config struct {
 	// Image generation is an optional, last-resort sports poster
 	// source. Both URL and key must be set; researched poster caching still
 	// works when generation is disabled.
-	ImageGenURL    string
-	ImageGenAPIKey string
-	PosterInterval time.Duration
+	ImageGenURL      string
+	ImageGenAPIKey   string
+	PosterInterval   time.Duration
+	PosterMaxPerPass int
 
 	// Proactive DVR reconciler (internal/reconcile). Pulls Sonarr/Radarr
 	// wanted-lists, matches them against the upcoming EPG, and schedules
@@ -340,6 +341,10 @@ func Load() (Config, error) {
 	if err != nil || dvrDefaultPriority <= 0 {
 		return Config{}, fmt.Errorf("CONDUCTOR_DVR_DEFAULT_PRIORITY: must be a positive integer")
 	}
+	posterMaxPerPass, err := strconv.Atoi(envDefault("CONDUCTOR_POSTER_MAX_PER_PASS", "6"))
+	if err != nil || posterMaxPerPass <= 0 {
+		return Config{}, fmt.Errorf("CONDUCTOR_POSTER_MAX_PER_PASS: must be a positive integer")
+	}
 	liveStartupLead, err := time.ParseDuration(envDefault("CONDUCTOR_LIVE_STARTUP_LEAD", "4s"))
 	if err != nil || liveStartupLead < 0 || liveStartupLead > 10*time.Second {
 		return Config{}, fmt.Errorf("CONDUCTOR_LIVE_STARTUP_LEAD: must be a duration between 0 and 10s")
@@ -428,7 +433,8 @@ func Load() (Config, error) {
 		PosterCacheDir:           posterCacheDirDefault(dataDir),
 		ImageGenURL:              os.Getenv("CONDUCTOR_IMAGE_GEN_URL"),
 		ImageGenAPIKey:           os.Getenv("CONDUCTOR_IMAGE_GEN_API_KEY"),
-		PosterInterval:           parseDurationDefault(os.Getenv("CONDUCTOR_POSTER_INTERVAL"), 10*time.Minute),
+		PosterInterval:           parseDurationDefault(os.Getenv("CONDUCTOR_POSTER_INTERVAL"), time.Hour),
+		PosterMaxPerPass:         posterMaxPerPass,
 		SonarrURL:                os.Getenv("CONDUCTOR_SONARR_URL"),
 		SonarrAPIKey:             os.Getenv("CONDUCTOR_SONARR_API_KEY"),
 		RadarrURL:                os.Getenv("CONDUCTOR_RADARR_URL"),

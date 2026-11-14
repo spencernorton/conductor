@@ -396,3 +396,41 @@ func TestPosterWorkerPollsSharedRemoteJobOncePerPassAfterError(t *testing.T) {
 		t.Fatalf("shared failed job was retried in one pass: submits=%d waits=%d stats=%+v", g.submits, g.waits, stats)
 	}
 }
+
+func TestPosterWorkerBatchesUpToDefaultSixGenerationsPerPass(t *testing.T) {
+	teams := []string{
+		"Mets @ Phillies",
+		"Cubs @ Cardinals",
+		"Dodgers @ Giants",
+		"Red Sox @ Yankees",
+		"Astros @ Rangers",
+		"Braves @ Marlins",
+		"Mariners @ Angels",
+	}
+	candidates := make([]store.PosterCandidate, 0, len(teams))
+	for i, title := range teams {
+		candidates = append(candidates, store.PosterCandidate{
+			ProgramID: uuid.New(), ChannelID: uuid.New(), Title: strings.TrimSpace(title),
+			Category: []string{"Sports", "MLB"}, IsLive: true,
+			SourceHash: "sports:mlb:batch-" + string(rune('a'+i)), EnrichmentState: "failed",
+		})
+	}
+	f := &fakePosterStore{
+		candidates: candidates,
+		assets:     map[string]store.PosterAsset{},
+	}
+	var b bytes.Buffer
+	if err := png.Encode(&b, image.NewRGBA(image.Rect(0, 0, 200, 300))); err != nil {
+		t.Fatal(err)
+	}
+	g := &fakeGenerator{body: b.Bytes()}
+	w := NewPosterWorker(slog.New(slog.NewTextHandler(io.Discard, nil)), f,
+		poster.NewAssetStore(t.TempDir()), g)
+	if w.Interval != time.Hour || w.MaxGenerationsPerPass != 6 {
+		t.Fatalf("worker defaults interval=%v max=%d, want 1h/6", w.Interval, w.MaxGenerationsPerPass)
+	}
+	stats := w.RunOnce(context.Background())
+	if g.submits != 6 || stats.Generations != 6 || stats.GeneratedApplied != 6 || stats.Skipped != 1 {
+		t.Fatalf("expected 6 generations and 1 deferred candidate; submits=%d stats=%+v", g.submits, stats)
+	}
+}

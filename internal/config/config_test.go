@@ -136,3 +136,35 @@ func TestLoadCommskipDryRunDefaultsTrue(t *testing.T) {
 		t.Fatalf("false: dry run still on, err %v", err)
 	}
 }
+
+func TestLoadPosterWorkerBatchDefaults(t *testing.T) {
+	t.Setenv("CONDUCTOR_DATA_DIR", t.TempDir())
+	t.Setenv("CONDUCTOR_DEVICE_ID", "A1B2C3D4")
+	t.Setenv("CONDUCTOR_POSTER_INTERVAL", "")
+	t.Setenv("CONDUCTOR_POSTER_MAX_PER_PASS", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PosterInterval != time.Hour || cfg.PosterMaxPerPass != 6 {
+		t.Fatalf("defaults interval=%v max=%d, want 1h/6", cfg.PosterInterval, cfg.PosterMaxPerPass)
+	}
+
+	t.Setenv("CONDUCTOR_POSTER_INTERVAL", "30m")
+	t.Setenv("CONDUCTOR_POSTER_MAX_PER_PASS", "4")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PosterInterval != 30*time.Minute || cfg.PosterMaxPerPass != 4 {
+		t.Fatalf("configured interval=%v max=%d, want 30m/4", cfg.PosterInterval, cfg.PosterMaxPerPass)
+	}
+
+	for _, bad := range []string{"0", "-1", "many"} {
+		t.Setenv("CONDUCTOR_POSTER_MAX_PER_PASS", bad)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "CONDUCTOR_POSTER_MAX_PER_PASS") {
+			t.Fatalf("bad=%q: err=%v, want CONDUCTOR_POSTER_MAX_PER_PASS validation", bad, err)
+		}
+	}
+}
