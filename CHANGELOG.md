@@ -3,6 +3,10 @@
 All notable changes to Conductor are recorded here. Versions follow
 [semantic versioning](https://semver.org/); each release is a tag on `main`.
 
+## 0.62.0 — 2026-11-14
+
+- The sports poster worker now runs hourly (`CONDUCTOR_POSTER_INTERVAL`, default `1h`) and batches up to six image-generation requests per pass (`CONDUCTOR_POSTER_MAX_PER_PASS`, default `6`). Total hourly poster throughput is unchanged, while on-demand diffusion backends wake once per hour instead of every 10 minutes.
+
 ## 0.61.2 — 2026-10-30
 
 - A recording gets until shortly after its programme starts to receive
