@@ -378,10 +378,12 @@ func main() {
 				logger, db, poster.NewAssetStore(cfg.PosterCacheDir), imageGenerator,
 			)
 			posterWorker.Interval = cfg.PosterInterval
+			posterWorker.MaxGenerationsPerPass = cfg.PosterMaxPerPass
 			deps.PosterWorker = posterWorker
 			go posterWorker.Run(ctx)
 			logger.Info("poster worker enabled",
 				"interval", cfg.PosterInterval,
+				"max_generations_per_pass", cfg.PosterMaxPerPass,
 				"generation_enabled", imageGenerator != nil)
 		}
 
