@@ -1,6 +1,7 @@
 package epg
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,6 +29,10 @@ type Output struct {
 	// LogoBaseURL, when set, is where channel <icon> URLs point for logos
 	// served from /logos/. Stream URLs stay on baseURL.
 	LogoBaseURL string
+
+	cacheMu   sync.RWMutex
+	cachedTag string
+	cachedXML []byte
 }
 
 func NewOutput(db *store.DB, baseURL string) *Output {
@@ -79,7 +85,51 @@ func (o *Output) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			rows[i].ChannelLogoURL = rebaseLogoURL(rows[i].ChannelLogoURL, o.baseURL, o.LogoBaseURL)
 		}
 	}
-	serveXMLTVRepresentation(w, r, rows, o.baseURL, latest, now)
+	o.serveCachedXMLTV(w, r, rows, o.baseURL, latest, now)
+}
+
+func (o *Output) serveCachedXMLTV(
+	w http.ResponseWriter,
+	r *http.Request,
+	rows []store.ProgramOutputRow,
+	baseURL string,
+	latest, now time.Time,
+) {
+	rows = projectProgramsForOutput(rows, now)
+	etag := outputETag(rows, baseURL)
+	w.Header().Set("ETag", etag)
+	lastModified := latest.UTC().Truncate(time.Second)
+	if !latest.IsZero() {
+		w.Header().Set("Last-Modified", lastModified.Format(http.TimeFormat))
+	}
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	if match := r.Header.Get("If-None-Match"); match != "" {
+		if ifNoneMatchMatches(match, etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+
+	o.cacheMu.RLock()
+	if o.cachedTag == etag && len(o.cachedXML) > 0 {
+		body := o.cachedXML
+		o.cacheMu.RUnlock()
+		_, _ = w.Write(body)
+		return
+	}
+	o.cacheMu.RUnlock()
+
+	var buf bytes.Buffer
+	buf.Grow(len(rows) * 512)
+	emitXMLTVProjectedWriter(&buf, rows, baseURL)
+	body := buf.Bytes()
+
+	o.cacheMu.Lock()
+	o.cachedTag = etag
+	o.cachedXML = body
+	o.cacheMu.Unlock()
+
+	_, _ = w.Write(body)
 }
 
 // rebaseLogoURL moves a self-hosted logo — "/logos/<file>", or the same
@@ -306,6 +356,14 @@ func emitXMLTV(w http.ResponseWriter, rows []store.ProgramOutputRow, baseURL str
 }
 
 func emitXMLTVProjected(w http.ResponseWriter, rows []store.ProgramOutputRow, baseURL string) {
+	emitXMLTVProjectedWriter(w, rows, baseURL)
+}
+
+type xmlWriter interface {
+	Write([]byte) (int, error)
+}
+
+func emitXMLTVProjectedWriter(w xmlWriter, rows []store.ProgramOutputRow, baseURL string) {
 	_, _ = w.Write([]byte(xml.Header))
 	_, _ = w.Write([]byte(`<tv generator-info-name="Conductor" source-info-name="conductor">` + "\n"))
 
@@ -341,7 +399,7 @@ func emitXMLTVProjected(w http.ResponseWriter, rows []store.ProgramOutputRow, ba
 	_, _ = w.Write([]byte(`</tv>` + "\n"))
 }
 
-func emitPPVIdleNotice(w http.ResponseWriter, r store.ProgramOutputRow) {
+func emitPPVIdleNotice(w xmlWriter, r store.ProgramOutputRow) {
 	fmt.Fprintf(w, "  <programme channel=%q start=%q stop=%q>\n",
 		xmltvChannelID(r), formatXMLTVTime(r.StartAt), formatXMLTVTime(r.EndAt))
 	title := r.Title
@@ -375,7 +433,7 @@ func xmltvChannelID(r store.ProgramOutputRow) string {
 	return "ch.conductor.unknown"
 }
 
-func emitChannel(w http.ResponseWriter, r store.ProgramOutputRow, id, baseURL string) {
+func emitChannel(w xmlWriter, r store.ProgramOutputRow, id, baseURL string) {
 	fmt.Fprintf(w, "  <channel id=%q>\n", id)
 	fmt.Fprintf(w, "    <display-name>%s</display-name>\n", xmlEscape(r.ChannelName))
 	fmt.Fprintf(w, "    <display-name>%s</display-name>\n", trimZero(r.ChannelNumber))
@@ -386,7 +444,7 @@ func emitChannel(w http.ResponseWriter, r store.ProgramOutputRow, id, baseURL st
 	fmt.Fprintln(w, "  </channel>")
 }
 
-func emitProgramme(w http.ResponseWriter, r store.ProgramOutputRow, baseURL string) {
+func emitProgramme(w xmlWriter, r store.ProgramOutputRow, baseURL string) {
 	chID := xmltvChannelID(r)
 	fmt.Fprintf(w, "  <programme channel=%q start=%q stop=%q>\n",
 		chID, formatXMLTVTime(r.StartAt), formatXMLTVTime(r.EndAt))

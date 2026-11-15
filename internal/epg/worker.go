@@ -132,6 +132,8 @@ func (w *Worker) runOnce(ctx context.Context) IngestStats {
 			continue
 		}
 		added, updated, unchanged, status, etag, lastModified, ierr := Ingest(ctx, w.db, src, w.hc)
+		ierr = ScrubError(ierr, src.URL)
+		status = ScrubText(status, src.URL)
 		if errors.Is(ierr, store.ErrStaleEPGSnapshot) {
 			// This response was valid for an older source configuration or
 			// generation. It is intentional concurrency fencing, not an upstream
@@ -175,7 +177,7 @@ func (w *Worker) runOnce(ctx context.Context) IngestStats {
 		case ierr != nil:
 			stats.SourcesFailed++
 			w.logger.Warn("epg ingest source failed",
-				"src", src.Name, "url", src.URL, "err", ierr)
+				"src", src.Name, "url", RedactURL(src.URL), "err", ierr)
 		case status == "no_change":
 			stats.SourcesNoChange++
 			w.logger.Info("epg ingest source no_change", "src", src.Name)
