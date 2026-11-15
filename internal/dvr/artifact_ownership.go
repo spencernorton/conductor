@@ -19,6 +19,11 @@ import (
 	"github.com/spencercnorton/conductor/internal/store"
 )
 
+const (
+	artifactVolumeMarkerFile = ".conductor-fs-id"
+	maxVolumeMarkerAncestors = 8
+)
+
 // CurrentArtifactCheck distinguishes a usable owner from the exact owner this
 // call demoted. Demoted is important to a recorder that must refresh its local
 // replacement provenance before choosing the no-replace publish primitive;
@@ -72,6 +77,13 @@ type currentDVRArtifactStore interface {
 	DemoteMissingDVRArtifact(context.Context, uuid.UUID, string, string, string) (bool, error)
 }
 
+type volumeAliasArtifactStore interface {
+	ListDVRFilesystemAliases(context.Context) (map[string]string, error)
+	RecordDVRFilesystemAlias(context.Context, string, string, uuid.UUID) error
+	MigrateCurrentDVRArtifactFilesystem(context.Context, uuid.UUID, string, string, string, string) error
+	UpdateCurrentDVRArtifactStatSig(context.Context, uuid.UUID, string, string, string) error
+}
+
 type artifactReadFile interface {
 	io.Reader
 	Stat() (os.FileInfo, error)
@@ -92,9 +104,152 @@ func (osArtifactFilesystem) Open(path string) (artifactReadFile, error) {
 	return os.Open(path)
 }
 
+func parseVolumeMarkerID(raw string) (string, bool) {
+	id := strings.TrimSpace(raw)
+	if !strings.HasPrefix(id, "vol:") {
+		return "", false
+	}
+	parsed, err := uuid.Parse(strings.TrimPrefix(id, "vol:"))
+	if err != nil || parsed == uuid.Nil {
+		return "", false
+	}
+	return "vol:" + parsed.String(), true
+}
+
+// EnsureArtifactFilesystemMarker creates or reads a durable volume identity
+// marker (<rootDir>/.conductor-fs-id) inside an existing DVR output root.
+// Because kernel st_dev minor numbers can shift across host reboots, binding
+// mounted DVR storage to an on-volume UUID prevents false filesystem-identity
+// mismatches while still failing closed if the volume is unmounted.
+func EnsureArtifactFilesystemMarker(rootDir string) (string, error) {
+	rootDir = strings.TrimSpace(rootDir)
+	if rootDir == "" {
+		return "", errors.New("DVR output directory is required")
+	}
+	info, err := os.Stat(rootDir)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("DVR output path %q is not a directory", rootDir)
+	}
+	markerPath := filepath.Join(rootDir, artifactVolumeMarkerFile)
+	if existing, err := os.ReadFile(markerPath); err == nil {
+		if id, ok := parseVolumeMarkerID(string(existing)); ok {
+			return id, nil
+		}
+		return "", fmt.Errorf("invalid DVR volume marker in %q", markerPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+
+	candidate := "vol:" + uuid.NewString()
+	tmp, err := os.CreateTemp(rootDir, ".conductor-fs-id.tmp.*")
+	if err != nil {
+		return "", err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+
+	if _, err := tmp.WriteString(candidate + "\n"); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	_ = os.Chmod(tmpName, 0o644)
+
+	if err := os.Link(tmpName, markerPath); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			existing, readErr := os.ReadFile(markerPath)
+			if readErr != nil {
+				return "", readErr
+			}
+			if id, ok := parseVolumeMarkerID(string(existing)); ok {
+				return id, nil
+			}
+			return "", fmt.Errorf("invalid DVR volume marker in %q", markerPath)
+		}
+		return "", err
+	}
+	return candidate, nil
+}
+
+// resolveArtifactFilesystemID returns a durable volume marker (vol:<uuid>) when
+// an ancestor directory on the exact same st_dev contains .conductor-fs-id;
+// otherwise it falls back to the kernel st_dev identity (dev:<hex>). Stopping
+// at any st_dev change prevents an unmounted mountpoint or submount from
+// inheriting a parent directory's volume marker.
+func resolveArtifactFilesystemID(
+	targetPath string,
+	targetInfo os.FileInfo,
+	fsys artifactFilesystem,
+) (string, bool) {
+	rawID, ok := artifactFilesystemID(targetInfo)
+	if !ok {
+		return "", false
+	}
+	if strings.TrimSpace(targetPath) == "" || fsys == nil {
+		return rawID, true
+	}
+	dir := targetPath
+	if !targetInfo.IsDir() {
+		dir = filepath.Dir(targetPath)
+	}
+	dir = filepath.Clean(dir)
+
+	for depth := 0; depth < maxVolumeMarkerAncestors; depth++ {
+		dirInfo, err := fsys.Stat(dir)
+		if err != nil || !dirInfo.IsDir() {
+			break
+		}
+		dirDev, devOK := artifactFilesystemID(dirInfo)
+		if !devOK || dirDev != rawID {
+			break
+		}
+		markerPath := filepath.Join(dir, artifactVolumeMarkerFile)
+		if markerInfo, mErr := fsys.Stat(markerPath); mErr == nil &&
+			markerInfo.Mode().IsRegular() &&
+			markerInfo.Size() > 0 && markerInfo.Size() <= 128 {
+			if markerDev, mDevOK := artifactFilesystemID(markerInfo); mDevOK && markerDev == rawID {
+				if f, openErr := fsys.Open(markerPath); openErr == nil {
+					var buf [128]byte
+					n, _ := io.ReadFull(f, buf[:])
+					_ = f.Close()
+					if volID, valid := parseVolumeMarkerID(string(buf[:n])); valid {
+						return volID, true
+					}
+				}
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return rawID, true
+}
+
+func artifactStatSignature(info os.FileInfo) (string, bool) {
+	ino, inoOK := artifactInodeOf(info)
+	chg, chgOK := artifactChangeVersionOf(info)
+	if !inoOK || !chgOK {
+		return "", false
+	}
+	return fmt.Sprintf("v1:ino=%x:sz=%d:mt=%d:ct=%d.%d:mode=%o",
+		ino, info.Size(), info.ModTime().UnixNano(),
+		chg.seconds, chg.nanoseconds, uint32(info.Mode())), true
+}
+
 // ArtifactFilesystemIdentity returns the portable durable identity used to
 // bind current DVR ownership to the filesystem containing a canonical path.
-// It intentionally identifies the filesystem device, not the file inode.
+// It intentionally identifies the volume/device, not the file inode.
 func ArtifactFilesystemIdentity(path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", errors.New("DVR artifact path is required")
@@ -103,7 +258,7 @@ func ArtifactFilesystemIdentity(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	filesystemID, ok := artifactFilesystemID(info)
+	filesystemID, ok := resolveArtifactFilesystemID(path, info, osArtifactFilesystem{})
 	if !ok {
 		return "", errors.New("filesystem device identity is unavailable")
 	}
@@ -111,9 +266,17 @@ func ArtifactFilesystemIdentity(path string) (string, error) {
 }
 
 type currentArtifactInspection struct {
-	usable         bool
-	demotionReason string
-	filesystemID   string
+	usable           bool
+	demotionReason   string
+	filesystemID     string
+	statSig          string
+	provenLegacyFSID string
+	migratedFromFSID string
+}
+
+type artifactInspectionOptions struct {
+	aliases              map[string]string
+	allowStatSigFastPath bool
 }
 
 func indeterminateArtifactInspection(
@@ -165,6 +328,15 @@ func inspectCurrentDVRArtifact(
 	rec store.DVRRecording,
 	fsys artifactFilesystem,
 ) (currentArtifactInspection, error) {
+	return inspectCurrentDVRArtifactWithOptions(ctx, rec, fsys, artifactInspectionOptions{})
+}
+
+func inspectCurrentDVRArtifactWithOptions(
+	ctx context.Context,
+	rec store.DVRRecording,
+	fsys artifactFilesystem,
+	opts artifactInspectionOptions,
+) (currentArtifactInspection, error) {
 	if err := ctx.Err(); err != nil {
 		return currentArtifactInspection{}, err
 	}
@@ -179,45 +351,98 @@ func inspectCurrentDVRArtifact(
 		return currentArtifactInspection{}, ctxErr
 	}
 	observedFilesystemID := ""
+	migratedFromFSID := ""
+	provingUnverifiedAlias := false
 	if statErr == nil {
-		filesystemID, ok := artifactFilesystemID(pathInfo)
+		filesystemID, ok := resolveArtifactFilesystemID(rec.OutputPath, pathInfo, fsys)
 		if !ok {
 			return currentArtifactInspection{}, indeterminateArtifactInspection(
 				rec, "derive canonical artifact filesystem identity",
 				errors.New("filesystem device identity is unavailable"))
 		}
 		if rec.ArtifactFilesystemID != "" && rec.ArtifactFilesystemID != filesystemID {
-			return currentArtifactInspection{}, indeterminateArtifactInspection(
-				rec, "verify canonical artifact filesystem identity",
-				fmt.Errorf("filesystem=%q database=%q",
-					filesystemID, rec.ArtifactFilesystemID))
+			switch {
+			case opts.aliases != nil && opts.aliases[rec.ArtifactFilesystemID] == filesystemID:
+				migratedFromFSID = rec.ArtifactFilesystemID
+			case rec.ArtifactState == "validated" &&
+				strings.HasPrefix(rec.ArtifactFilesystemID, "dev:") &&
+				strings.HasPrefix(filesystemID, "vol:"):
+				// A validated artifact can cryptographically prove that dev:<old>
+				// was an earlier st_dev of vol:<uuid>, but ONLY if full SHA-256
+				// verification succeeds below.
+				provingUnverifiedAlias = true
+				migratedFromFSID = rec.ArtifactFilesystemID
+			default:
+				return currentArtifactInspection{}, indeterminateArtifactInspection(
+					rec, "verify canonical artifact filesystem identity",
+					fmt.Errorf("filesystem=%q database=%q",
+						filesystemID, rec.ArtifactFilesystemID))
+			}
 		}
 		observedFilesystemID = filesystemID
 	}
 	switch {
 	case statErr == nil && !pathInfo.Mode().IsRegular():
-		return currentArtifactInspection{demotionReason: fmt.Sprintf(
-			"canonical DVR artifact is not a regular file: mode=%s", pathInfo.Mode()),
-			filesystemID: observedFilesystemID}, nil
-	case statErr == nil && pathInfo.Size() <= 0:
+		if provingUnverifiedAlias {
+			return currentArtifactInspection{}, indeterminateArtifactInspection(
+				rec, "verify canonical artifact filesystem identity",
+				fmt.Errorf("filesystem=%q database=%q",
+					observedFilesystemID, rec.ArtifactFilesystemID))
+		}
 		return currentArtifactInspection{
-			demotionReason: "canonical DVR artifact is empty",
-			filesystemID:   observedFilesystemID,
+			demotionReason: fmt.Sprintf(
+				"canonical DVR artifact is not a regular file: mode=%s", pathInfo.Mode()),
+			filesystemID:     observedFilesystemID,
+			migratedFromFSID: migratedFromFSID,
+		}, nil
+	case statErr == nil && pathInfo.Size() <= 0:
+		if provingUnverifiedAlias {
+			return currentArtifactInspection{}, indeterminateArtifactInspection(
+				rec, "verify canonical artifact filesystem identity",
+				fmt.Errorf("filesystem=%q database=%q",
+					observedFilesystemID, rec.ArtifactFilesystemID))
+		}
+		return currentArtifactInspection{
+			demotionReason:   "canonical DVR artifact is empty",
+			filesystemID:     observedFilesystemID,
+			migratedFromFSID: migratedFromFSID,
 		}, nil
 	case statErr == nil:
 		if rec.ArtifactBytes > 0 && pathInfo.Size() != rec.ArtifactBytes {
-			return currentArtifactInspection{demotionReason: fmt.Sprintf(
-				"canonical DVR artifact byte evidence changed: filesystem=%d database=%d",
-				pathInfo.Size(), rec.ArtifactBytes),
-				filesystemID: observedFilesystemID}, nil
+			if provingUnverifiedAlias {
+				return currentArtifactInspection{}, indeterminateArtifactInspection(
+					rec, "verify canonical artifact filesystem identity",
+					fmt.Errorf("filesystem=%q database=%q",
+						observedFilesystemID, rec.ArtifactFilesystemID))
+			}
+			return currentArtifactInspection{
+				demotionReason: fmt.Sprintf(
+					"canonical DVR artifact byte evidence changed: filesystem=%d database=%d",
+					pathInfo.Size(), rec.ArtifactBytes),
+				filesystemID:     observedFilesystemID,
+				migratedFromFSID: migratedFromFSID,
+			}, nil
 		}
 		// A legacy owner has no trustworthy digest. Preserve the migration's
 		// deliberately limited size-only behavior until an explicit re-record
 		// replaces it with a validated artifact.
 		if rec.ArtifactState == "legacy" {
 			return currentArtifactInspection{
-				usable: true, filesystemID: observedFilesystemID,
+				usable:           true,
+				filesystemID:     observedFilesystemID,
+				migratedFromFSID: migratedFromFSID,
 			}, nil
+		}
+		if opts.allowStatSigFastPath && !provingUnverifiedAlias &&
+			migratedFromFSID == "" && rec.ArtifactFilesystemID == observedFilesystemID &&
+			rec.ArtifactStatSig != "" {
+			if sig, sigOK := artifactStatSignature(pathInfo); sigOK && sig == rec.ArtifactStatSig {
+				return currentArtifactInspection{
+					usable:       true,
+					filesystemID: observedFilesystemID,
+					statSig:      sig,
+				}, nil
+			}
 		}
 	case errors.Is(statErr, os.ErrNotExist):
 		// os.Stat also returns ENOENT for a dangling symlink. Its directory entry
@@ -235,17 +460,45 @@ func inspectCurrentDVRArtifact(
 				rec, "inspect canonical filesystem entry", lstatErr)
 		}
 		// ENOENT is conclusive only when an earlier successful inspection bound
-		// this owner to a durable filesystem identity and the containing directory
-		// is still reachable on that exact filesystem. Parent existence alone does
-		// not prove that a NAS or removable filesystem is mounted.
+		// this owner to a durable filesystem identity and the containing volume
+		// is still reachable on that exact filesystem.
 		if rec.ArtifactFilesystemID == "" {
 			return currentArtifactInspection{}, indeterminateArtifactInspection(
 				rec, "verify missing canonical artifact filesystem identity",
 				errors.New("owner has no durable filesystem identity evidence"))
 		}
-		parentInfo, parentErr := fsys.Stat(filepath.Dir(rec.OutputPath))
+		aliasedVolumeID := ""
+		if opts.aliases != nil {
+			aliasedVolumeID = opts.aliases[rec.ArtifactFilesystemID]
+		}
+		parentDir := filepath.Dir(rec.OutputPath)
+		parentInfo, parentErr := fsys.Stat(parentDir)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return currentArtifactInspection{}, ctxErr
+		}
+		// When the owner is bound (directly or via proven alias) to an on-volume
+		// vol:<uuid> marker and an importer removed both the media file and its
+		// empty leaf folder, walk up to the nearest existing directory; it still
+		// proves absence only if that ancestor resolves to the exact vol:<uuid>.
+		if errors.Is(parentErr, os.ErrNotExist) &&
+			(strings.HasPrefix(rec.ArtifactFilesystemID, "vol:") ||
+				strings.HasPrefix(aliasedVolumeID, "vol:")) {
+			cur := parentDir
+			for depth := 0; depth < maxVolumeMarkerAncestors && errors.Is(parentErr, os.ErrNotExist); depth++ {
+				if _, lErr := fsys.Lstat(cur); lErr == nil {
+					parentErr = errors.New("dangling symlink on ancestor directory")
+					break
+				}
+				next := filepath.Dir(cur)
+				if next == cur {
+					break
+				}
+				cur = next
+				parentInfo, parentErr = fsys.Stat(cur)
+				if parentErr == nil {
+					parentDir = cur
+				}
+			}
 		}
 		if parentErr != nil {
 			return currentArtifactInspection{}, indeterminateArtifactInspection(
@@ -256,22 +509,29 @@ func inspectCurrentDVRArtifact(
 				rec, "verify canonical artifact parent directory",
 				fmt.Errorf("parent mode=%s", parentInfo.Mode()))
 		}
-		parentFilesystemID, ok := artifactFilesystemID(parentInfo)
+		parentFilesystemID, ok := resolveArtifactFilesystemID(parentDir, parentInfo, fsys)
 		if !ok {
 			return currentArtifactInspection{}, indeterminateArtifactInspection(
 				rec, "derive canonical artifact parent filesystem identity",
 				errors.New("filesystem device identity is unavailable"))
 		}
-		if parentFilesystemID != rec.ArtifactFilesystemID {
-			return currentArtifactInspection{}, indeterminateArtifactInspection(
-				rec, "verify missing canonical artifact parent filesystem identity",
-				fmt.Errorf("parent=%q database=%q",
-					parentFilesystemID, rec.ArtifactFilesystemID))
+		if parentFilesystemID == rec.ArtifactFilesystemID {
+			return currentArtifactInspection{
+				demotionReason: "canonical DVR artifact is missing from the filesystem",
+				filesystemID:   rec.ArtifactFilesystemID,
+			}, nil
 		}
-		return currentArtifactInspection{
-			demotionReason: "canonical DVR artifact is missing from the filesystem",
-			filesystemID:   rec.ArtifactFilesystemID,
-		}, nil
+		if aliasedVolumeID != "" && parentFilesystemID == aliasedVolumeID {
+			return currentArtifactInspection{
+				demotionReason:   "canonical DVR artifact is missing from the filesystem",
+				filesystemID:     aliasedVolumeID,
+				migratedFromFSID: rec.ArtifactFilesystemID,
+			}, nil
+		}
+		return currentArtifactInspection{}, indeterminateArtifactInspection(
+			rec, "verify missing canonical artifact parent filesystem identity",
+			fmt.Errorf("parent=%q database=%q",
+				parentFilesystemID, rec.ArtifactFilesystemID))
 	default:
 		return currentArtifactInspection{}, indeterminateArtifactInspection(
 			rec, "stat canonical artifact", statErr)
@@ -362,13 +622,32 @@ func inspectCurrentDVRArtifact(
 
 	actualSHA := hash.Sum(nil)
 	if !bytes.Equal(actualSHA, rec.ArtifactSHA256) {
-		return currentArtifactInspection{demotionReason: fmt.Sprintf(
-			"canonical DVR artifact SHA-256 evidence changed: filesystem=%x database=%x",
-			actualSHA, rec.ArtifactSHA256),
-			filesystemID: observedFilesystemID}, nil
+		if provingUnverifiedAlias {
+			return currentArtifactInspection{}, indeterminateArtifactInspection(
+				rec, "verify canonical artifact filesystem identity",
+				fmt.Errorf("filesystem=%q database=%q",
+					observedFilesystemID, rec.ArtifactFilesystemID))
+		}
+		return currentArtifactInspection{
+			demotionReason: fmt.Sprintf(
+				"canonical DVR artifact SHA-256 evidence changed: filesystem=%x database=%x",
+				actualSHA, rec.ArtifactSHA256),
+			filesystemID:     observedFilesystemID,
+			migratedFromFSID: migratedFromFSID,
+		}, nil
+	}
+	sig, _ := artifactStatSignature(afterPathInfo)
+	provenLegacy := ""
+	if strings.HasPrefix(rec.ArtifactFilesystemID, "dev:") &&
+		strings.HasPrefix(observedFilesystemID, "vol:") {
+		provenLegacy = rec.ArtifactFilesystemID
 	}
 	return currentArtifactInspection{
-		usable: true, filesystemID: observedFilesystemID,
+		usable:           true,
+		filesystemID:     observedFilesystemID,
+		statSig:          sig,
+		provenLegacyFSID: provenLegacy,
+		migratedFromFSID: migratedFromFSID,
 	}, nil
 }
 
@@ -417,6 +696,14 @@ func applyCurrentDVRArtifactInspection(
 			"current DVR artifact %s inspection has no filesystem identity evidence",
 			rec.ID)
 	}
+	aliasStore, _ := db.(volumeAliasArtifactStore)
+	if inspection.provenLegacyFSID != "" && aliasStore != nil {
+		if err := aliasStore.RecordDVRFilesystemAlias(
+			ctx, inspection.provenLegacyFSID, inspection.filesystemID, rec.ID,
+		); err != nil {
+			return CurrentArtifactCheck{}, err
+		}
+	}
 	if rec.ArtifactFilesystemID == "" {
 		if !inspection.usable {
 			return CurrentArtifactCheck{}, indeterminateArtifactInspection(
@@ -430,9 +717,29 @@ func applyCurrentDVRArtifactInspection(
 		}
 		rec.ArtifactFilesystemID = inspection.filesystemID
 	} else if rec.ArtifactFilesystemID != inspection.filesystemID {
-		return CurrentArtifactCheck{}, store.ErrDVRArtifactFilesystemConflict
+		if inspection.migratedFromFSID == rec.ArtifactFilesystemID && aliasStore != nil {
+			if err := aliasStore.MigrateCurrentDVRArtifactFilesystem(
+				ctx, rec.ID, rec.OutputPath, rec.ArtifactFilesystemID,
+				inspection.filesystemID, inspection.statSig,
+			); err != nil {
+				return CurrentArtifactCheck{}, err
+			}
+			rec.ArtifactFilesystemID = inspection.filesystemID
+			if inspection.statSig != "" {
+				rec.ArtifactStatSig = inspection.statSig
+			}
+		} else {
+			return CurrentArtifactCheck{}, store.ErrDVRArtifactFilesystemConflict
+		}
 	}
 	if inspection.usable {
+		if aliasStore != nil && inspection.statSig != "" && inspection.statSig != rec.ArtifactStatSig {
+			if err := aliasStore.UpdateCurrentDVRArtifactStatSig(
+				ctx, rec.ID, rec.OutputPath, rec.ArtifactFilesystemID, inspection.statSig,
+			); err != nil {
+				return CurrentArtifactCheck{}, err
+			}
+		}
 		return CurrentArtifactCheck{Usable: true}, nil
 	}
 	if strings.TrimSpace(inspection.demotionReason) == "" {
@@ -463,8 +770,15 @@ func reconcileCurrentDVRArtifactWith(
 	if err != nil || !eligible {
 		return CurrentArtifactCheck{}, err
 	}
-
-	inspection, err := inspectCurrentDVRArtifact(ctx, rec, fsys)
+	var opts artifactInspectionOptions
+	if aliasStore, ok := db.(volumeAliasArtifactStore); ok {
+		aliases, aliasErr := aliasStore.ListDVRFilesystemAliases(ctx)
+		if aliasErr != nil {
+			return CurrentArtifactCheck{}, aliasErr
+		}
+		opts.aliases = aliases
+	}
+	inspection, err := inspectCurrentDVRArtifactWithOptions(ctx, rec, fsys, opts)
 	if err != nil {
 		return CurrentArtifactCheck{}, err
 	}
@@ -483,9 +797,147 @@ func ReconcileCurrentDVRArtifacts(
 		return CurrentDVRArtifactReconcileSummary{},
 			errors.New("DVR artifact database is required")
 	}
-	return reconcileCurrentDVRArtifactsWith(
+	return reconcileStartupCurrentDVRArtifacts(
 		ctx, db, logger, osArtifactFilesystem{},
 		DefaultStartupDVRArtifactInspectionBudget)
+}
+
+// reconcileStartupCurrentDVRArtifacts proves legacy dev:* -> vol:<uuid> aliases
+// using one SHA-256-verified file per distinct dev:*, immediately reconciles
+// stat-only rows (ENOENT missing imports, legacy owners, and stat-sig-matched
+// validated owners) so missing imports are never blocked behind multi-gigabyte
+// first-time hashing, and then hashes remaining validated owners within budget.
+func reconcileStartupCurrentDVRArtifacts(
+	ctx context.Context,
+	db *store.DB,
+	logger *slog.Logger,
+	fsys artifactFilesystem,
+	budget time.Duration,
+) (CurrentDVRArtifactReconcileSummary, error) {
+	if budget <= 0 {
+		return CurrentDVRArtifactReconcileSummary{},
+			errors.New("startup DVR artifact inspection budget must be positive")
+	}
+	startedAt := time.Now()
+	aliases, err := db.ListDVRFilesystemAliases(ctx)
+	if err != nil {
+		return CurrentDVRArtifactReconcileSummary{}, err
+	}
+	rows, err := db.ListCurrentDVRArtifacts(ctx)
+	if err != nil {
+		return CurrentDVRArtifactReconcileSummary{}, err
+	}
+	if len(rows) == 0 {
+		return CurrentDVRArtifactReconcileSummary{}, nil
+	}
+
+	// Step 1: Prove at most one existing validated file per distinct unproven
+	// legacy dev:* identity so missing/legacy rows sharing that dev:* can be
+	// cleanly migrated and demoted immediately.
+	aliasBudget := min(5*time.Second, budget/2)
+	for _, rec := range rows {
+		if time.Since(startedAt) >= aliasBudget {
+			break
+		}
+		if rec.ArtifactState != "validated" ||
+			!strings.HasPrefix(rec.ArtifactFilesystemID, "dev:") ||
+			aliases[rec.ArtifactFilesystemID] != "" {
+			continue
+		}
+		info, statErr := fsys.Stat(rec.OutputPath)
+		if statErr != nil || !info.Mode().IsRegular() || info.Size() != rec.ArtifactBytes {
+			continue
+		}
+		fsID, ok := resolveArtifactFilesystemID(rec.OutputPath, info, fsys)
+		if !ok || !strings.HasPrefix(fsID, "vol:") {
+			continue
+		}
+		rem := budget - time.Since(startedAt)
+		if rem <= 0 {
+			break
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, rem)
+		inspection, inspectErr := inspectCurrentDVRArtifactWithOptions(
+			probeCtx, rec, fsys, artifactInspectionOptions{aliases: aliases})
+		cancel()
+		if inspectErr != nil || !inspection.usable || inspection.provenLegacyFSID == "" {
+			continue
+		}
+		if _, applyErr := applyCurrentDVRArtifactInspection(ctx, db, rec, inspection); applyErr != nil {
+			return CurrentDVRArtifactReconcileSummary{}, applyErr
+		}
+		aliases[inspection.provenLegacyFSID] = inspection.filesystemID
+	}
+
+	// Step 2: Fast non-hashing sweep for ENOENT missing files, legacy owners,
+	// size mismatches, and already stat-sig-stamped validated owners.
+	var fastSummary CurrentDVRArtifactReconcileSummary
+	currentRows, err := db.ListCurrentDVRArtifacts(ctx)
+	if err != nil {
+		return CurrentDVRArtifactReconcileSummary{}, err
+	}
+	for _, rec := range currentRows {
+		eligible, validateErr := validateCurrentDVRArtifactOwner(rec)
+		if validateErr != nil {
+			return CurrentDVRArtifactReconcileSummary{}, validateErr
+		}
+		if !eligible {
+			continue
+		}
+		pathInfo, statErr := fsys.Stat(rec.OutputPath)
+		needsFullHash := false
+		if statErr == nil && pathInfo.Mode().IsRegular() && pathInfo.Size() > 0 &&
+			(rec.ArtifactBytes <= 0 || pathInfo.Size() == rec.ArtifactBytes) &&
+			rec.ArtifactState == "validated" {
+			fsID, ok := resolveArtifactFilesystemID(rec.OutputPath, pathInfo, fsys)
+			sig, sigOK := artifactStatSignature(pathInfo)
+			if !ok || !sigOK || rec.ArtifactFilesystemID != fsID ||
+				rec.ArtifactStatSig == "" || rec.ArtifactStatSig != sig {
+				needsFullHash = true
+			}
+		}
+		if needsFullHash {
+			continue
+		}
+		inspection, inspectErr := inspectCurrentDVRArtifactWithOptions(
+			ctx, rec, fsys, artifactInspectionOptions{
+				aliases:              aliases,
+				allowStatSigFastPath: true,
+			})
+		if inspectErr != nil {
+			var indErr *IndeterminateArtifactInspectionError
+			if errors.As(inspectErr, &indErr) {
+				continue
+			}
+			return fastSummary, inspectErr
+		}
+		check, applyErr := applyCurrentDVRArtifactInspection(ctx, db, rec, inspection)
+		if applyErr != nil {
+			var indErr *IndeterminateArtifactInspectionError
+			if errors.As(applyErr, &indErr) {
+				continue
+			}
+			return fastSummary, applyErr
+		}
+		if check.Demoted {
+			fastSummary.Demoted++
+			if logger != nil {
+				logger.Warn("demoted invalid current DVR artifact",
+					"recording_id", rec.ID, "path", rec.OutputPath,
+					"artifact_state", rec.ArtifactState,
+					"reason", check.Reason)
+			}
+		}
+	}
+
+	remainingBudget := max(50*time.Millisecond, budget-time.Since(startedAt))
+	hashSummary, err := reconcileCurrentDVRArtifactsWithOptions(
+		ctx, db, logger, fsys, remainingBudget, artifactInspectionOptions{
+			aliases:              aliases,
+			allowStatSigFastPath: true,
+		})
+	hashSummary.Demoted += fastSummary.Demoted
+	return hashSummary, err
 }
 
 type startupArtifactInspectionResult struct {
@@ -538,6 +990,18 @@ func reconcileCurrentDVRArtifactsWith(
 	fsys artifactFilesystem,
 	budget time.Duration,
 ) (CurrentDVRArtifactReconcileSummary, error) {
+	return reconcileCurrentDVRArtifactsWithOptions(
+		ctx, db, logger, fsys, budget, artifactInspectionOptions{})
+}
+
+func reconcileCurrentDVRArtifactsWithOptions(
+	ctx context.Context,
+	db currentDVRArtifactStore,
+	logger *slog.Logger,
+	fsys artifactFilesystem,
+	budget time.Duration,
+	opts artifactInspectionOptions,
+) (CurrentDVRArtifactReconcileSummary, error) {
 	if budget <= 0 {
 		return CurrentDVRArtifactReconcileSummary{},
 			errors.New("startup DVR artifact inspection budget must be positive")
@@ -560,6 +1024,18 @@ func reconcileCurrentDVRArtifactsWith(
 		return CurrentDVRArtifactReconcileSummary{}, nil
 	}
 
+	var workerAliases map[string]string
+	if len(opts.aliases) > 0 {
+		workerAliases = make(map[string]string, len(opts.aliases))
+		for k, v := range opts.aliases {
+			workerAliases[k] = v
+		}
+	}
+	workerOpts := artifactInspectionOptions{
+		aliases:              workerAliases,
+		allowStatSigFastPath: opts.allowStatSigFastPath,
+	}
+
 	inspectionCtx, cancelInspection := context.WithTimeout(ctx, budget)
 	defer cancelInspection()
 	results := make(chan startupArtifactInspectionResult)
@@ -567,8 +1043,8 @@ func reconcileCurrentDVRArtifactsWith(
 	go func() {
 		defer close(workerDone)
 		for index, rec := range rows {
-			inspection, inspectErr := inspectCurrentDVRArtifact(
-				inspectionCtx, rec, fsys)
+			inspection, inspectErr := inspectCurrentDVRArtifactWithOptions(
+				inspectionCtx, rec, fsys, workerOpts)
 			select {
 			case results <- startupArtifactInspectionResult{
 				index: index, inspection: inspection, err: inspectErr,

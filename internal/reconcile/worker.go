@@ -205,7 +205,7 @@ func (w *Worker) reconcile(ctx context.Context) {
 	for _, m := range matches {
 		if !w.eligible(m) {
 			deferred++
-			w.Logger.Info("reconcile: candidate not recorded",
+			w.Logger.Debug("reconcile: candidate not recorded",
 				"want", m.WantLabel, "program", m.Program.Title,
 				"channel", m.Program.ChannelName, "start", m.Program.StartAt,
 				"confidence", m.Confidence, "reason", m.Reason, "source", m.Source)
@@ -407,7 +407,9 @@ func (w *Worker) scheduleOne(ctx context.Context, m Match) bool {
 	}
 
 	progID := m.Program.ProgramID
+	intentID := uuid.New()
 	intent := store.DVRRecording{
+		ID:                 intentID,
 		ChannelID:          m.Program.ChannelID,
 		ProgramID:          &progID,
 		Title:              m.Program.Title,
@@ -428,16 +430,24 @@ func (w *Worker) scheduleOne(ctx context.Context, m Match) bool {
 	if errors.Is(err, store.ErrOutputPathBusy) ||
 		errors.Is(err, store.ErrValidatedArtifactExists) {
 		// A different airing is active for this canonical output, or a validated
-		// artifact already owns it. Treat both as handled; only the authenticated,
-		// target-bound replacement path may supersede validated media.
-		w.Logger.Info("reconcile: output already has active or validated ownership; skipping",
+		// artifact already owns it. Treat both as handled without consuming the
+		// per-cycle new-booking cap so later wants in the window are not starved.
+		w.Logger.Debug("reconcile: output already has active or validated ownership; skipping",
 			"want", m.WantLabel, "program", m.Program.Title,
 			"existing", rec.ID, "existing_start", rec.ScheduledStart, "output", output)
-		return true
+		return false
 	}
 	if err != nil {
 		w.Logger.Warn("reconcile: schedule failed",
 			"want", m.WantLabel, "program", m.Program.Title, "err", err)
+		return false
+	}
+	if rec.ID != intentID {
+		// Exact-airing retry confirmed an existing booking from an earlier cycle;
+		// do not count re-confirmations against MaxPerCycle.
+		w.Logger.Debug("reconcile: recording already booked",
+			"id", rec.ID, "want", m.WantLabel, "program", m.Program.Title,
+			"start", m.Program.StartAt, "output", output)
 		return false
 	}
 	w.Logger.Info("reconcile: scheduled recording",

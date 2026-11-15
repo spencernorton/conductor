@@ -29,6 +29,12 @@ type EnrichmentStore interface {
 	ManualLookup
 }
 
+// CachePurger is an optional capability implemented by *StoreAdapter to sweep
+// expired response-cache rows and aged indexer search logs periodically.
+type CachePurger interface {
+	PurgeExpiredCaches(ctx context.Context) (int64, error)
+}
+
 // Worker drains epg_program rows whose enrichment_status='pending'.
 // Runs every Interval; processes up to BatchSize rows per pass; rate-limits
 // outbound TMDb calls via a small sleep between requests.
@@ -39,12 +45,16 @@ type Worker struct {
 	Interval       time.Duration // default 5m
 	BatchSize      int           // default 50 per pass
 	BetweenRequest time.Duration // default 200ms ≈ 5 req/s
+	PurgeInterval  time.Duration // default 1h
+
+	lastPurge time.Time
 }
 
 func NewWorker(logger *slog.Logger, enricher *Enricher, store EnrichmentStore) *Worker {
 	return &Worker{
 		Logger: logger, Enricher: enricher, Store: store,
 		Interval: 5 * time.Minute, BatchSize: 50, BetweenRequest: 200 * time.Millisecond,
+		PurgeInterval: time.Hour,
 	}
 }
 
@@ -73,7 +83,33 @@ func (w *Worker) RunOnce(ctx context.Context) (matched, failed, skipped int) {
 	return w.runOnce(ctx)
 }
 
+func (w *Worker) maybePurgeCaches(ctx context.Context) {
+	purger, ok := w.Store.(CachePurger)
+	if !ok {
+		return
+	}
+	interval := w.PurgeInterval
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	now := time.Now()
+	if !w.lastPurge.IsZero() && now.Sub(w.lastPurge) < interval {
+		return
+	}
+	w.lastPurge = now
+	purged, err := purger.PurgeExpiredCaches(ctx)
+	if err != nil && w.Logger != nil {
+		w.Logger.Warn("enrichment cache purge errored", "purged", purged, "err", err)
+		return
+	}
+	if purged > 0 && w.Logger != nil {
+		w.Logger.Info("enrichment purged expired cache and log rows", "purged", purged)
+	}
+}
+
 func (w *Worker) runOnce(ctx context.Context) (matched, failed, skipped int) {
+	w.maybePurgeCaches(ctx)
+
 	pending, err := w.Store.ListPendingEnrichment(ctx, w.BatchSize)
 	if err != nil {
 		w.Logger.Warn("enrichment list failed", "err", err)
