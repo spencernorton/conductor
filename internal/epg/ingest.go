@@ -143,9 +143,14 @@ func Ingest(ctx context.Context, db *store.DB, src store.EPGSource, hc *http.Cli
 		hc = &http.Client{Timeout: 5 * time.Minute}
 	}
 
+	fail := func(err error) (int, int, int, string, string, string, error) {
+		cleanErr := ScrubError(err, src.URL)
+		return 0, 0, 0, "error: " + cleanErr.Error(), src.LastETag, src.LastModified, cleanErr
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src.URL, nil)
 	if err != nil {
-		return 0, 0, 0, "error: " + err.Error(), src.LastETag, src.LastModified, err
+		return fail(err)
 	}
 	if src.LastETag != "" {
 		req.Header.Set("If-None-Match", src.LastETag)
@@ -163,29 +168,30 @@ func Ingest(ctx context.Context, db *store.DB, src store.EPGSource, hc *http.Cli
 
 	resp, err := hc.Do(req)
 	if err != nil {
-		return 0, 0, 0, "error: " + err.Error(), src.LastETag, src.LastModified, err
+		return fail(err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotModified {
 		if (src.LastETag == "" && src.LastModified == "") || src.SnapshotGeneration == 0 {
 			err := errors.New("upstream returned 304 to an unconditional EPG snapshot request")
-			return 0, 0, 0, "error: " + err.Error(), src.LastETag, src.LastModified, err
+			return fail(err)
 		}
 		if err := db.ValidateEPGSourceSnapshot(ctx, src); err != nil {
-			return 0, 0, 0, "error: " + err.Error(), src.LastETag, src.LastModified, err
+			return fail(err)
 		}
 		return 0, 0, 0, "no_change", src.LastETag, src.LastModified, nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		msg := fmt.Sprintf("error: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		safeBody := ScrubText(strings.TrimSpace(string(body)), src.URL)
+		msg := fmt.Sprintf("error: HTTP %d: %s", resp.StatusCode, safeBody)
 		return 0, 0, 0, msg, src.LastETag, src.LastModified, fmt.Errorf("status %d", resp.StatusCode)
 	}
 
 	doc, err := ParseXMLTV(resp.Body)
 	if err != nil {
-		return 0, 0, 0, "error: " + err.Error(), src.LastETag, src.LastModified, err
+		return fail(err)
 	}
 
 	programs, mappings, skipped, err := normalizePrograms(ctx, db, src, doc)
@@ -193,14 +199,14 @@ func Ingest(ctx context.Context, db *store.DB, src store.EPGSource, hc *http.Cli
 		// Never persist validators for a representation that did not publish.
 		// Otherwise the retry may receive 304 forever while the prior snapshot
 		// remains installed.
-		return 0, 0, 0, "error: " + err.Error(), src.LastETag, src.LastModified, err
+		return fail(err)
 	}
 	result, err := db.ReplaceEPGSourceSnapshot(
 		ctx, src, programs, mappings,
 		resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"),
 	)
 	if err != nil {
-		return 0, 0, 0, "error: " + err.Error(), src.LastETag, src.LastModified, err
+		return fail(err)
 	}
 	added, updated, unchanged = result.Added, result.Updated, result.Unchanged
 	status = "ok"
