@@ -47,7 +47,7 @@ RUN set -eu; \
       -o /out/conductor \
       ./cmd/conductor
 
-FROM nvidia/cuda:12.4.1-runtime-ubuntu24.04
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
 
 # ffmpeg from Ubuntu is built with NVENC support; libnvidia-encode is
 # provided at runtime by the NVIDIA Container Runtime (driver libs from
