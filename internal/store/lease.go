@@ -1487,6 +1487,10 @@ func (db *DB) ReconcileStartup(ctx context.Context) (StartupReconcileResult, err
 			           WHEN artifact_stage = 'publishing' THEN artifact_filesystem_id
 			           ELSE ''
 			       END,
+			       artifact_stat_sig = CASE
+			           WHEN artifact_stage = 'publishing' THEN artifact_stat_sig
+			           ELSE ''
+			       END,
 			       artifact_error = CASE
 			           WHEN artifact_stage = 'publishing' THEN artifact_error
 			           ELSE $1

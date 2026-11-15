@@ -624,7 +624,7 @@ func (r *Recorder) finalizeArtifact(
 				publishedInfo.Size(), report.ArtifactBytes)
 		default:
 			var ok bool
-			filesystemID, ok = artifactFilesystemID(publishedInfo)
+			filesystemID, ok = resolveArtifactFilesystemID(rec.OutputPath, publishedInfo, osArtifactFilesystem{})
 			if !ok {
 				publishedStatErr = errors.New(
 					"published DVR artifact filesystem identity is unavailable")

@@ -21,6 +21,14 @@ func artifactFilesystemID(info os.FileInfo) (string, bool) {
 	return fmt.Sprintf("dev:%x", uint64(uint32(stat.Dev))), true
 }
 
+func artifactInodeOf(info os.FileInfo) (uint64, bool) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat == nil {
+		return 0, false
+	}
+	return uint64(stat.Ino), true
+}
+
 func artifactChangeVersionOf(info os.FileInfo) (artifactChangeVersion, bool) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || stat == nil {

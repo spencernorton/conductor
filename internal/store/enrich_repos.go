@@ -339,3 +339,27 @@ func (db *DB) PutTVDbCache(ctx context.Context, kind, queryHash, queryLabel stri
 		kind, queryHash, queryLabel, string(response))
 	return err
 }
+
+// PurgeExpiredTVDbCache drops TVDb/TVmaze cache rows past their 30-day TTL.
+func (db *DB) PurgeExpiredTVDbCache(ctx context.Context) (int64, error) {
+	tag, err := db.Pool.Exec(ctx,
+		`DELETE FROM tvdb_response_cache WHERE expires_at <= now()`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// PurgeOldIndexerSearchLogs bounds dvr_indexer_search_log retention.
+func (db *DB) PurgeOldIndexerSearchLogs(ctx context.Context, keepDays int) (int64, error) {
+	if keepDays <= 0 {
+		keepDays = 30
+	}
+	tag, err := db.Pool.Exec(ctx,
+		`DELETE FROM dvr_indexer_search_log WHERE requested_at < now() - ($1::int * interval '1 day')`,
+		keepDays)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}

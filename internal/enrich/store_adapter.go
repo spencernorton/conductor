@@ -3,6 +3,7 @@ package enrich
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -83,3 +84,26 @@ func (a *StoreAdapter) Put(ctx context.Context, kind, queryHash, queryLabel stri
 // title_norm field consistently — both the worker (when looking up
 // overrides) and the admin endpoint (when storing them).
 func NormalizeForMatch(s string) string { return normalizeForMatch(s) }
+
+// PurgeExpiredCaches sweeps expired TMDb/TVDb/TVmaze response cache rows and
+// trims Torznab audit search logs older than 30 days.
+func (a *StoreAdapter) PurgeExpiredCaches(ctx context.Context) (int64, error) {
+	var total int64
+	var errs []error
+	if n, err := a.DB.PurgeExpiredTMDbCache(ctx); err != nil {
+		errs = append(errs, err)
+	} else {
+		total += n
+	}
+	if n, err := a.DB.PurgeExpiredTVDbCache(ctx); err != nil {
+		errs = append(errs, err)
+	} else {
+		total += n
+	}
+	if n, err := a.DB.PurgeOldIndexerSearchLogs(ctx, 30); err != nil {
+		errs = append(errs, err)
+	} else {
+		total += n
+	}
+	return total, errors.Join(errs...)
+}

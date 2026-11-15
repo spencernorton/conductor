@@ -58,6 +58,7 @@ type DVRRecording struct {
 	ArtifactBytes            int64
 	ArtifactSHA256           []byte
 	ArtifactFilesystemID     string
+	ArtifactStatSig          string
 	ArtifactValidatedAt      *time.Time
 	ArtifactValidatorVersion string
 	ArtifactError            string
@@ -80,7 +81,7 @@ const dvrRecordingColumns = `
 	started_at, completed_at, error, created_at, completion_operation_id,
 	recording_heartbeat_at, artifact_state, artifact_stage,
 	artifact_current, artifact_path, artifact_bytes, artifact_sha256,
-	artifact_filesystem_id,
+	artifact_filesystem_id, artifact_stat_sig,
 	artifact_validated_at, artifact_validator_version, artifact_error,
 	replaces_recording_id, explicit_rerecord, media_duration_ms,
 	media_max_gap_ms, media_discontinuities, media_av_start_delta_ms,
@@ -101,7 +102,7 @@ func scanDVRRecording(row dvrRowScanner) (DVRRecording, error) {
 		&r.StartedAt, &r.CompletedAt, &r.Error, &r.CreatedAt,
 		&r.CompletionOperationID, &r.RecordingHeartbeatAt, &r.ArtifactState,
 		&r.ArtifactStage, &r.ArtifactCurrent, &r.ArtifactPath,
-		&r.ArtifactBytes, &r.ArtifactSHA256, &r.ArtifactFilesystemID,
+		&r.ArtifactBytes, &r.ArtifactSHA256, &r.ArtifactFilesystemID, &r.ArtifactStatSig,
 		&r.ArtifactValidatedAt,
 		&r.ArtifactValidatorVersion, &r.ArtifactError,
 		&r.ReplacesRecordingID, &r.ExplicitRerecord, &r.MediaDurationMS,
@@ -1340,7 +1341,7 @@ func (db *DB) RejectDVRRecordingArtifact(
 		       artifact_state = 'rejected', artifact_stage = 'none',
 		       artifact_current = false, artifact_path = $3,
 		       artifact_bytes = $4, artifact_sha256 = NULL,
-		       artifact_filesystem_id = '',
+		       artifact_filesystem_id = '', artifact_stat_sig = '',
 		       artifact_validated_at = NULL, artifact_validator_version = '',
 		       artifact_error = $2, media_duration_ms = $5,
 		       media_max_gap_ms = $6, media_discontinuities = $7,
@@ -1459,7 +1460,7 @@ func (db *DB) PromoteDVRRecordingArtifact(
 			ct, err := tx.Exec(ctx, `
 				UPDATE dvr_recording
 				   SET artifact_current = false, artifact_state = 'superseded',
-				       artifact_path = $2
+				       artifact_path = $2, artifact_stat_sig = ''
 				 WHERE id = $1 AND artifact_current AND output_path = $3`,
 				predecessor.ID, predecessorBackupPath, canonicalPath)
 			if err != nil {
@@ -1488,7 +1489,7 @@ func (db *DB) PromoteDVRRecordingArtifact(
 			       artifact_state = 'validated', artifact_stage = 'none',
 			       artifact_current = true, artifact_path = $4,
 			       artifact_bytes = $2, artifact_sha256 = $5,
-			       artifact_filesystem_id = $6,
+			       artifact_filesystem_id = $6, artifact_stat_sig = '',
 			       artifact_validated_at = clock_timestamp(),
 			       artifact_validator_version = $7, artifact_error = '',
 			       media_duration_ms = $8, media_max_gap_ms = $9,
@@ -1679,7 +1680,7 @@ func (db *DB) DemoteMissingDVRArtifact(
 		}
 		ct, err := tx.Exec(ctx, `
 			UPDATE dvr_recording
-			   SET artifact_current=false, artifact_state='missing', artifact_error=$4
+			   SET artifact_current=false, artifact_state='missing', artifact_error=$4, artifact_stat_sig=''
 			 WHERE id=$1 AND output_path=$2 AND artifact_current
 			   AND artifact_filesystem_id=$3`,
 			id, outputPath, expectedFilesystemID, reason)
@@ -1739,7 +1740,7 @@ func (db *DB) FinishDVRPublishRecovery(
 			       recording_heartbeat_at = clock_timestamp(),
 			       artifact_stage = 'none', artifact_state = 'rejected',
 			       artifact_current = false, artifact_path = $3,
-			       artifact_sha256 = NULL, artifact_filesystem_id = '',
+			       artifact_sha256 = NULL, artifact_filesystem_id = '', artifact_stat_sig = '',
 			       artifact_validated_at = NULL,
 			       artifact_validator_version = '', artifact_error = $2,
 			       error = CASE
@@ -1794,4 +1795,140 @@ func (db *DB) ListStaleDVRRecordings(
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ListDVRFilesystemAliases returns all cryptographically proven mappings from
+// historical kernel st_dev identities (dev:<hex>) to durable volume markers
+// (vol:<uuid>).
+func (db *DB) ListDVRFilesystemAliases(ctx context.Context) (map[string]string, error) {
+	rows, err := db.Pool.Query(ctx, `
+		SELECT legacy_filesystem_id, volume_filesystem_id
+		  FROM dvr_filesystem_alias`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]string)
+	for rows.Next() {
+		var legacyID, volumeID string
+		if err := rows.Scan(&legacyID, &volumeID); err != nil {
+			return nil, err
+		}
+		out[legacyID] = volumeID
+	}
+	return out, rows.Err()
+}
+
+// RecordDVRFilesystemAlias persists proof that legacyID (dev:<hex>) belongs to
+// the durable volume marker volumeID (vol:<uuid>), established by a validated
+// recording whose full SHA-256 matched on volumeID.
+func (db *DB) RecordDVRFilesystemAlias(
+	ctx context.Context,
+	legacyID, volumeID string,
+	provenBy uuid.UUID,
+) error {
+	legacyID = strings.TrimSpace(legacyID)
+	volumeID = strings.TrimSpace(volumeID)
+	if !strings.HasPrefix(legacyID, "dev:") || !strings.HasPrefix(volumeID, "vol:") || provenBy == uuid.Nil {
+		return errors.New("valid dev:* legacy ID, vol:* volume ID, and proving recording ID are required")
+	}
+	var existing string
+	err := db.Pool.QueryRow(ctx, `
+		INSERT INTO dvr_filesystem_alias (legacy_filesystem_id, volume_filesystem_id, proven_by_recording_id)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (legacy_filesystem_id) DO UPDATE
+		   SET legacy_filesystem_id = EXCLUDED.legacy_filesystem_id
+		RETURNING volume_filesystem_id`,
+		legacyID, volumeID, provenBy).Scan(&existing)
+	if err != nil {
+		return err
+	}
+	if existing != volumeID {
+		return ErrDVRArtifactFilesystemConflict
+	}
+	return nil
+}
+
+// MigrateCurrentDVRArtifactFilesystem atomically rebinds a current owner from a
+// proven legacy dev:<hex> identity to its durable vol:<uuid> marker.
+func (db *DB) MigrateCurrentDVRArtifactFilesystem(
+	ctx context.Context,
+	id uuid.UUID,
+	outputPath, expectedOldFSID, newVolumeFSID, statSig string,
+) error {
+	if id == uuid.Nil || strings.TrimSpace(outputPath) == "" {
+		return errors.New("current DVR artifact identity and output path are required")
+	}
+	expectedOldFSID = strings.TrimSpace(expectedOldFSID)
+	newVolumeFSID = strings.TrimSpace(newVolumeFSID)
+	if expectedOldFSID == "" || !strings.HasPrefix(newVolumeFSID, "vol:") {
+		return errors.New("expected legacy filesystem ID and vol:* target are required")
+	}
+	return db.InTx(ctx, func(tx pgx.Tx) error {
+		if err := lockDVROutputPath(ctx, tx, outputPath); err != nil {
+			return err
+		}
+		rec, err := scanDVRRecording(tx.QueryRow(ctx, `SELECT `+dvrRecordingColumns+`
+			FROM dvr_recording WHERE id=$1 FOR UPDATE`, id))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if !rec.ArtifactCurrent || rec.State != "completed" ||
+			(rec.ArtifactState != "legacy" && rec.ArtifactState != "validated") ||
+			rec.OutputPath != outputPath ||
+			(rec.ArtifactPath != "" && rec.ArtifactPath != outputPath) {
+			return ErrDVRArtifactFilesystemConflict
+		}
+		if rec.ArtifactFilesystemID == newVolumeFSID {
+			if statSig != "" && rec.ArtifactStatSig != statSig {
+				_, err := tx.Exec(ctx, `
+					UPDATE dvr_recording SET artifact_stat_sig=$2
+					 WHERE id=$1 AND artifact_current`, id, statSig)
+				return err
+			}
+			return nil
+		}
+		if rec.ArtifactFilesystemID != expectedOldFSID {
+			return ErrDVRArtifactFilesystemConflict
+		}
+		ct, err := tx.Exec(ctx, `
+			UPDATE dvr_recording
+			   SET artifact_filesystem_id=$2,
+			       artifact_stat_sig=CASE WHEN $3 <> '' THEN $3 ELSE artifact_stat_sig END
+			 WHERE id=$1 AND artifact_current AND artifact_filesystem_id=$4`,
+			id, newVolumeFSID, statSig, expectedOldFSID)
+		if err != nil {
+			return err
+		}
+		if ct.RowsAffected() != 1 {
+			return ErrDVRArtifactFilesystemConflict
+		}
+		return nil
+	})
+}
+
+// UpdateCurrentDVRArtifactStatSig persists the post-SHA-256 stat signature so
+// subsequent startup sweeps can verify unchanged files without re-reading
+// hundreds of gigabytes.
+func (db *DB) UpdateCurrentDVRArtifactStatSig(
+	ctx context.Context,
+	id uuid.UUID,
+	outputPath, expectedFSID, statSig string,
+) error {
+	if id == uuid.Nil || strings.TrimSpace(outputPath) == "" ||
+		strings.TrimSpace(expectedFSID) == "" || strings.TrimSpace(statSig) == "" {
+		return nil
+	}
+	_, err := db.Pool.Exec(ctx, `
+		UPDATE dvr_recording
+		   SET artifact_stat_sig = $4
+		 WHERE id = $1
+		   AND output_path = $2
+		   AND artifact_current
+		   AND artifact_filesystem_id = $3`,
+		id, outputPath, expectedFSID, statSig)
+	return err
 }

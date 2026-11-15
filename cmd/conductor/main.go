@@ -192,6 +192,17 @@ func main() {
 		} else if recovered > 0 {
 			logger.Warn("startup recovered interrupted DVR artifact publishes", "count", recovered)
 		}
+		if cfg.DVROutputDir != "" {
+			if info, statErr := os.Stat(cfg.DVROutputDir); statErr == nil && info.IsDir() {
+				if volID, markerErr := dvr.EnsureArtifactFilesystemMarker(cfg.DVROutputDir); markerErr != nil {
+					logger.Warn("failed to ensure DVR volume identity marker",
+						"dir", cfg.DVROutputDir, "err", markerErr)
+				} else {
+					logger.Info("verified DVR volume identity marker",
+						"dir", cfg.DVROutputDir, "filesystem_id", volID)
+				}
+			}
+		}
 		if reconciled, err := dvr.ReconcileCurrentDVRArtifacts(ctx, db, logger); err != nil {
 			logger.Error("startup DVR artifact ownership reconcile failed", "err", err)
 			os.Exit(1)
