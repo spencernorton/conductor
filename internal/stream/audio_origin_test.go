@@ -829,3 +829,107 @@ func TestAudioOriginRefusalCarriesSlugIntoDiagnosticReason(t *testing.T) {
 		t.Fatalf("wrapped reason=%v", wrapped)
 	}
 }
+
+func TestAudioOriginProbeResolvesBoundaryStraddleInsteadOfStallingToByteCap(t *testing.T) {
+	tests := []struct {
+		name       string
+		rawInitial time.Duration
+		videoLead  time.Duration // video arrival lead ahead of each audio packet at 1.0x rate
+	}{
+		{
+			name:       "initial_above_2s_paired_median_just_below_2s",
+			rawInitial: 2102 * time.Millisecond,
+			videoLead:  185 * time.Millisecond, // paired skew = +1917ms (<2s) while initial = +2102ms (>=2s)
+		},
+		{
+			name:       "negative_initial_above_2s_paired_median_just_below_2s",
+			rawInitial: -2102 * time.Millisecond,
+			videoLead:  0, // video starts at basePTS, then advances +185ms before audio samples; see packet loop
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := newBoundAudioOriginProbe(t, audioOriginTestFirst)
+			basePTS := uint64(100) * transportPTSRate
+			var packets [][]byte
+			if tc.rawInitial > 0 {
+				// Video starts at basePTS and leads each audio sample by +185ms in arrival
+				// order while both tracks advance ~480ms total (|drift| < 100ms):
+				// initial = +2102ms (>=2s), pairedMedian = +1917ms (<2s).
+				packets = append(packets,
+					testTimestampedPESPacket(audioOriginTestVideo, 0xe0, basePTS, 0),
+					testTimestampedPESPacket(audioOriginTestVideo, 0xe0, addSignedPTSTestOffset(basePTS, 90*time.Millisecond), 1),
+				)
+				for i := 0; i < int(minAudioOriginSamples); i++ {
+					vPTS := addSignedPTSTestOffset(basePTS, tc.videoLead+time.Duration(i)*60*time.Millisecond)
+					aPTS := addSignedPTSTestOffset(basePTS, tc.rawInitial+time.Duration(i)*68*time.Millisecond)
+					packets = append(packets,
+						testTimestampedPESPacket(audioOriginTestVideo, 0xe0, vPTS, byte(i+2)),
+						testTimestampedPESPacket(audioOriginTestFirst, 0xc0, aPTS, byte(i)),
+					)
+				}
+			} else {
+				// Audio lags video by -2102ms at track start, while audio arrives slightly
+				// ahead of the next video frame so paired skew sits at -1922ms (<2s abs)
+				// and both tracks span ~540ms (|drift| < 100ms).
+				packets = append(packets,
+					testTimestampedPESPacket(audioOriginTestVideo, 0xe0, basePTS, 0),
+					testTimestampedPESPacket(audioOriginTestVideo, 0xe0, addSignedPTSTestOffset(basePTS, 30*time.Millisecond), 1),
+				)
+				for i := 0; i <= int(minAudioOriginSamples); i++ {
+					aPTS := addSignedPTSTestOffset(basePTS, tc.rawInitial+time.Duration(i+3)*60*time.Millisecond)
+					if i == 0 {
+						aPTS = addSignedPTSTestOffset(basePTS, tc.rawInitial)
+					}
+					vPTS := addSignedPTSTestOffset(basePTS, time.Duration(i+1)*60*time.Millisecond)
+					if i == int(minAudioOriginSamples) {
+						vPTS = addSignedPTSTestOffset(basePTS, time.Duration(i+3)*60*time.Millisecond)
+					}
+					packets = append(packets,
+						testTimestampedPESPacket(audioOriginTestFirst, 0xc0, aPTS, byte(i)),
+						testTimestampedPESPacket(audioOriginTestVideo, 0xe0, vPTS, byte(i+2)),
+					)
+				}
+			}
+			ready, correction, err := probe.push(joinTSPackets(packets...), time.Unix(1_700_002_000, 0))
+			if err != nil || !ready {
+				t.Fatalf("boundary-straddle probe stalled: ready=%v correction=%s err=%v snapshot=%+v",
+					ready, correction, err, probe.timeline.snapshotAt(time.Unix(1_700_002_000, 0)))
+			}
+			if absoluteDuration(correction+tc.rawInitial) > 2*time.Millisecond {
+				t.Fatalf("correction=%s, want %s", correction, -tc.rawInitial)
+			}
+		})
+	}
+}
+
+func TestAudioOriginProbeAllowsHighBitrateRawMuxUpToExpandedCap(t *testing.T) {
+	probe := newBoundAudioOriginProbe(t, audioOriginTestFirst)
+	basePTS := uint64(100) * transportPTSRate
+	// ~210 KiB per audio sample (~1.68 MiB for 8 samples), representing a
+	// 15+ Mbps RAW 1080p60 backup feed that previously hit the 1.5 MiB cap.
+	padding := bytes.Repeat(pcrTestNonPCRPacket(0x1fff, false), (210*1024)/tsPacketSize)
+	var ready bool
+	var correction time.Duration
+	var err error
+	for i := 0; i < int(minAudioOriginSamples); i++ {
+		videoPTS := basePTS + durationTicks(time.Duration(i)*50*time.Millisecond, transportPTSRate)
+		block := joinTSPackets(
+			testTimestampedPESPacket(audioOriginTestVideo, 0xe0, videoPTS, byte(i)),
+			testTimestampedPESPacket(audioOriginTestFirst, 0xc0,
+				addSignedPTSTestOffset(videoPTS, -3200*time.Millisecond), byte(i)),
+		)
+		block = append(block, padding...)
+		ready, correction, err = probe.push(block, time.Unix(1_700_002_100, 0))
+		if err != nil {
+			t.Fatalf("high-bitrate RAW mux refused at %d bytes: %v", len(probe.buffer), err)
+		}
+	}
+	if len(probe.buffer) <= 1536*1024 || len(probe.buffer) > maxAudioOriginProbeBytes {
+		t.Fatalf("expected buffer in (1536 KiB, %d], got %d", maxAudioOriginProbeBytes, len(probe.buffer))
+	}
+	if !ready || absoluteDuration(correction-3200*time.Millisecond) > time.Millisecond {
+		t.Fatalf("decision=(ready=%v correction=%s err=%v)", ready, correction, err)
+	}
+}
