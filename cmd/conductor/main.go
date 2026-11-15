@@ -441,11 +441,13 @@ func main() {
 			}
 			arrConfigured := (cfg.SonarrURL != "" && cfg.SonarrAPIKey != "") ||
 				(cfg.RadarrURL != "" && cfg.RadarrAPIKey != "")
+			var arrImportStage *postprocess.ArrImportStage
 			if cfg.ArrImportTrigger && arrConfigured {
-				stages = append(stages, postprocess.NewArrImportStage(
+				arrImportStage = postprocess.NewArrImportStage(
 					postprocess.ArrTarget{BaseURL: cfg.SonarrURL, APIKey: cfg.SonarrAPIKey},
 					postprocess.ArrTarget{BaseURL: cfg.RadarrURL, APIKey: cfg.RadarrAPIKey},
-				))
+				)
+				stages = append(stages, arrImportStage)
 				stageNames = append(stageNames, "arr-import")
 			}
 			if len(stages) > 0 {
@@ -513,6 +515,21 @@ func main() {
 					"radarr", radarrClient != nil,
 					"plex_gap", plexClient != nil,
 					"dry_run", cfg.ReconcileDryRun)
+			}
+			if cfg.DVROutputDir != "" {
+				retentionWorker := &reconcile.RetentionWorker{
+					Logger:               logger,
+					DB:                   db,
+					Sonarr:               sonarrClient,
+					Radarr:               radarrClient,
+					ArrImport:            arrImportStage,
+					OutputDir:            cfg.DVROutputDir,
+					Interval:             cfg.ReconcileInterval,
+					UnrequestedRetention: cfg.DVRUnrequestedRetention,
+					ImportedGrace:        cfg.DVRImportedGrace,
+					DiagnosticRetention:  cfg.DVRDiagnosticRetention,
+				}
+				go retentionWorker.Run(ctx)
 			}
 		}
 		logger.Info("db mode enabled", "dsn_host", maskDSN(cfg.PostgresDSN))

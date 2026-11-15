@@ -48,7 +48,7 @@ func MatchMovies(progs []Program, wants []MovieWant) []Match {
 		consider := func(p Program, conf float64, reason string) {
 			best = pick(best, Match{
 				Program: p, Kind: "movie", Confidence: conf, Reason: reason,
-				WantLabel: movieLabel(w), ArrTitle: w.Title,
+				WantLabel: movieLabel(w), ArrTitle: w.Title, Year: w.Year,
 			})
 		}
 		if w.TMDbID > 0 {
@@ -108,6 +108,7 @@ func MatchEpisodes(progs []Program, wants []EpisodeWant) []Match {
 				Program: p, Kind: "episode", Confidence: conf, Reason: reason,
 				WantLabel: episodeLabel(w), ArrTitle: w.SeriesTitle,
 				Season: w.Season, Episode: w.Episode,
+				SeriesType: w.SeriesType, AirDateLocal: w.AirDateLocal,
 			})
 		}
 		wantOnscreen := onscreen(w.Season, w.Episode)

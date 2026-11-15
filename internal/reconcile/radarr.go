@@ -11,8 +11,8 @@ import (
 )
 
 // RadarrClient is a minimal read-only Radarr v3 API client. It reads the
-// wanted/missing list — monitored movies with no file — which is exactly
-// the set the reconciler should try to record off live TV.
+// wanted/missing list — monitored movies with no file — and full movie library
+// state for DVR retention verification.
 type RadarrClient struct {
 	BaseURL string // e.g. http://192.0.2.10:7878
 	APIKey  string
@@ -27,14 +27,20 @@ func NewRadarrClient(baseURL, apiKey string) *RadarrClient {
 	}
 }
 
+type radarrAltTitle struct {
+	Title string `json:"title"`
+}
+
 // radarrMovie is the subset of Radarr's MovieResource we consume.
 type radarrMovie struct {
-	Title     string `json:"title"`
-	Year      int    `json:"year"`
-	TMDbID    int    `json:"tmdbId"`
-	IMDbID    string `json:"imdbId"`
-	HasFile   bool   `json:"hasFile"`
-	Monitored bool   `json:"monitored"`
+	ID              int              `json:"id"`
+	Title           string           `json:"title"`
+	Year            int              `json:"year"`
+	TMDbID          int              `json:"tmdbId"`
+	IMDbID          string           `json:"imdbId"`
+	HasFile         bool             `json:"hasFile"`
+	Monitored       bool             `json:"monitored"`
+	AlternateTitles []radarrAltTitle `json:"alternateTitles"`
 }
 
 type radarrMissingPage struct {
@@ -72,6 +78,15 @@ func (c *RadarrClient) WantedMovies(ctx context.Context) ([]MovieWant, error) {
 		}
 	}
 	return wants, nil
+}
+
+// LibraryMovies returns every movie tracked by Radarr (monitored or not).
+func (c *RadarrClient) LibraryMovies(ctx context.Context) ([]radarrMovie, error) {
+	var out []radarrMovie
+	if err := c.get(ctx, "/api/v3/movie", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *RadarrClient) get(ctx context.Context, path string, q url.Values, out any) error {

@@ -168,3 +168,50 @@ func TestLoadPosterWorkerBatchDefaults(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadDVRRetentionDefaults(t *testing.T) {
+	t.Setenv("CONDUCTOR_DATA_DIR", t.TempDir())
+	t.Setenv("CONDUCTOR_DEVICE_ID", "A1B2C3D4")
+	t.Setenv("CONDUCTOR_DVR_UNREQUESTED_RETENTION", "")
+	t.Setenv("CONDUCTOR_DVR_IMPORTED_GRACE", "")
+	t.Setenv("CONDUCTOR_DVR_DIAGNOSTIC_RETENTION", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DVRUnrequestedRetention != 720*time.Hour ||
+		cfg.DVRImportedGrace != 15*time.Minute ||
+		cfg.DVRDiagnosticRetention != 24*time.Hour {
+		t.Fatalf("unexpected defaults: unrequested=%v grace=%v diag=%v",
+			cfg.DVRUnrequestedRetention, cfg.DVRImportedGrace, cfg.DVRDiagnosticRetention)
+	}
+
+	t.Setenv("CONDUCTOR_DVR_UNREQUESTED_RETENTION", "0")
+	t.Setenv("CONDUCTOR_DVR_IMPORTED_GRACE", "30m")
+	t.Setenv("CONDUCTOR_DVR_DIAGNOSTIC_RETENTION", "48h")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DVRUnrequestedRetention != -1 ||
+		cfg.DVRImportedGrace != 30*time.Minute ||
+		cfg.DVRDiagnosticRetention != 48*time.Hour {
+		t.Fatalf("unexpected configured retention: unrequested=%v grace=%v diag=%v",
+			cfg.DVRUnrequestedRetention, cfg.DVRImportedGrace, cfg.DVRDiagnosticRetention)
+	}
+
+	for _, key := range []string{
+		"CONDUCTOR_DVR_UNREQUESTED_RETENTION",
+		"CONDUCTOR_DVR_IMPORTED_GRACE",
+		"CONDUCTOR_DVR_DIAGNOSTIC_RETENTION",
+	} {
+		t.Setenv("CONDUCTOR_DVR_UNREQUESTED_RETENTION", "720h")
+		t.Setenv("CONDUCTOR_DVR_IMPORTED_GRACE", "15m")
+		t.Setenv("CONDUCTOR_DVR_DIAGNOSTIC_RETENTION", "24h")
+		t.Setenv(key, "-5m")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), key) {
+			t.Fatalf("key=%s err=%v, want validation error", key, err)
+		}
+	}
+}

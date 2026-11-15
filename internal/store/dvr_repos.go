@@ -1932,3 +1932,276 @@ func (db *DB) UpdateCurrentDVRArtifactStatSig(
 		id, outputPath, expectedFSID, statSig)
 	return err
 }
+
+// DVRCompletedArtifact pairs a current completed DVR recording with any
+// enrichment external IDs still attached to its source EPG programme so
+// retention can match Sonarr/Radarr libraries by TVDb/TMDb/IMDb ID first.
+type DVRCompletedArtifact struct {
+	Recording DVRRecording
+	TMDbID    int
+	IMDbID    string
+	TVDBID    int
+}
+
+// ListCurrentCompletedDVRRecordings returns completed DVR recordings that still
+// hold current canonical filesystem ownership and are not mid-stage.
+func (db *DB) ListCurrentCompletedDVRRecordings(ctx context.Context) ([]DVRCompletedArtifact, error) {
+	rows, err := db.Pool.Query(ctx, `SELECT `+dvrRecordingColumns+`
+		  FROM dvr_recording
+		 WHERE state = 'completed'
+		   AND artifact_current
+		   AND artifact_stage = 'none'
+		   AND completed_at IS NOT NULL
+		 ORDER BY completed_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var recs []DVRRecording
+	seenProg := make(map[uuid.UUID]struct{})
+	var progIDs []uuid.UUID
+	for rows.Next() {
+		rec, err := scanDVRRecording(rows)
+		if err != nil {
+			return nil, err
+		}
+		recs = append(recs, rec)
+		if rec.ProgramID != nil && *rec.ProgramID != uuid.Nil {
+			if _, ok := seenProg[*rec.ProgramID]; !ok {
+				seenProg[*rec.ProgramID] = struct{}{}
+				progIDs = append(progIDs, *rec.ProgramID)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(recs) == 0 {
+		return nil, nil
+	}
+
+	type enrichIDs struct {
+		tmdb int
+		imdb string
+		tvdb int
+	}
+	byProg := make(map[uuid.UUID]enrichIDs, len(progIDs))
+	if len(progIDs) > 0 {
+		eRows, err := db.Pool.Query(ctx, `
+			SELECT program_id, COALESCE(tmdb_id, 0), COALESCE(imdb_id, ''), COALESCE(tvdb_id, 0)
+			  FROM epg_program_enrichment
+			 WHERE program_id = ANY($1)`, progIDs)
+		if err != nil {
+			return nil, err
+		}
+		defer eRows.Close()
+		for eRows.Next() {
+			var pid uuid.UUID
+			var ids enrichIDs
+			if err := eRows.Scan(&pid, &ids.tmdb, &ids.imdb, &ids.tvdb); err != nil {
+				return nil, err
+			}
+			byProg[pid] = ids
+		}
+		if err := eRows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	out := make([]DVRCompletedArtifact, len(recs))
+	for i, rec := range recs {
+		item := DVRCompletedArtifact{Recording: rec}
+		if rec.ProgramID != nil {
+			if ids, ok := byProg[*rec.ProgramID]; ok {
+				item.TMDbID = ids.tmdb
+				item.IMDbID = ids.imdb
+				item.TVDBID = ids.tvdb
+			}
+		}
+		out[i] = item
+	}
+	return out, nil
+}
+
+// HasActiveDVRDependency reports whether any scheduled, recording, or
+// mid-stage DVR row currently targets outputPath or binds id as its
+// replacement predecessor. Retention must leave such artifacts untouched.
+func (db *DB) HasActiveDVRDependency(ctx context.Context, id uuid.UUID, outputPath string) (bool, error) {
+	if id == uuid.Nil || strings.TrimSpace(outputPath) == "" {
+		return false, errors.New("DVR recording id and output path are required")
+	}
+	var exists bool
+	err := db.Pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			  FROM dvr_recording
+			 WHERE id <> $1
+			   AND (replaces_recording_id = $1 OR output_path = $2)
+			   AND (state IN ('scheduled', 'recording') OR artifact_stage <> 'none')
+		)`, id, outputPath).Scan(&exists)
+	return exists, err
+}
+
+// ArchivePrunedDVRArtifact transitions a pruned current completed artifact to
+// historical non-current ownership under the canonical output advisory lock.
+func (db *DB) ArchivePrunedDVRArtifact(
+	ctx context.Context,
+	id uuid.UUID,
+	expectedOutputPath string,
+) (bool, error) {
+	if id == uuid.Nil || strings.TrimSpace(expectedOutputPath) == "" {
+		return false, errors.New("DVR recording id and expected output path are required")
+	}
+	archived := false
+	err := db.InTx(ctx, func(tx pgx.Tx) error {
+		if err := lockDVROutputPath(ctx, tx, expectedOutputPath); err != nil {
+			return err
+		}
+		rec, err := scanDVRRecording(tx.QueryRow(ctx, `SELECT `+dvrRecordingColumns+`
+			FROM dvr_recording WHERE id=$1 FOR UPDATE`, id))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if !rec.ArtifactCurrent || rec.State != "completed" ||
+			rec.ArtifactStage != "none" || rec.OutputPath != expectedOutputPath {
+			return nil
+		}
+		var publishingSuccessor uuid.UUID
+		err = tx.QueryRow(ctx, `
+			SELECT id
+			  FROM dvr_recording
+			 WHERE replaces_recording_id=$1
+			   AND artifact_stage='publishing'
+			 LIMIT 1
+			 FOR UPDATE`, id).Scan(&publishingSuccessor)
+		switch {
+		case err == nil:
+			return ErrDVRArtifactPublishInProgress
+		case errors.Is(err, pgx.ErrNoRows):
+		default:
+			return err
+		}
+		ct, err := tx.Exec(ctx, `
+			UPDATE dvr_recording
+			   SET artifact_current = false,
+			       artifact_state = 'historical',
+			       artifact_stat_sig = ''
+			 WHERE id = $1
+			   AND output_path = $2
+			   AND artifact_current
+			   AND state = 'completed'
+			   AND artifact_stage = 'none'`, id, expectedOutputPath)
+		if err != nil {
+			return err
+		}
+		if ct.RowsAffected() != 1 {
+			return nil
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE dvr_recording
+			   SET replaces_recording_id = NULL, explicit_rerecord = false
+			 WHERE replaces_recording_id = $1
+			   AND state IN ('scheduled', 'recording')`, id); err != nil {
+			return err
+		}
+		archived = true
+		return nil
+	})
+	return archived, err
+}
+
+// ListActiveDVRArtifactPaths returns all output_path and artifact_path values
+// referenced by scheduled, recording, or mid-stage rows so diagnostic temp-file
+// cleanup never unlinks an active capture or publish candidate.
+func (db *DB) ListActiveDVRArtifactPaths(ctx context.Context) ([]string, error) {
+	rows, err := db.Pool.Query(ctx, `
+		SELECT DISTINCT p
+		  FROM (
+			SELECT output_path AS p
+			  FROM dvr_recording
+			 WHERE state IN ('scheduled', 'recording') OR artifact_stage <> 'none'
+			UNION ALL
+			SELECT artifact_path AS p
+			  FROM dvr_recording
+			 WHERE state IN ('scheduled', 'recording') OR artifact_stage <> 'none'
+		  ) active
+		 WHERE p <> ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// UpdateUnstartedDVRRecordingOutputPath updates a scheduled, unstarted
+// non-replacement recording's canonical output path when deterministic naming
+// metadata improves before capture starts.
+func (db *DB) UpdateUnstartedDVRRecordingOutputPath(
+	ctx context.Context,
+	id uuid.UUID,
+	oldOutputPath, newOutputPath string,
+	startsAfter time.Time,
+) (bool, error) {
+	oldOutputPath = strings.TrimSpace(oldOutputPath)
+	newOutputPath = strings.TrimSpace(newOutputPath)
+	if id == uuid.Nil || oldOutputPath == "" || newOutputPath == "" || oldOutputPath == newOutputPath {
+		return false, nil
+	}
+	firstLock, secondLock := oldOutputPath, newOutputPath
+	if secondLock < firstLock {
+		firstLock, secondLock = secondLock, firstLock
+	}
+	updated := false
+	var outcomeErr error
+	err := db.InTx(ctx, func(tx pgx.Tx) error {
+		if err := lockDVROutputPath(ctx, tx, firstLock); err != nil {
+			return err
+		}
+		if err := lockDVROutputPath(ctx, tx, secondLock); err != nil {
+			return err
+		}
+		if _, err := findActiveDVRRecordingForOutputPath(ctx, tx, newOutputPath); err == nil {
+			outcomeErr = ErrOutputPathBusy
+			return nil
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if _, err := findCurrentDVRArtifactForOutputPath(ctx, tx, newOutputPath, false); err == nil {
+			outcomeErr = ErrValidatedArtifactExists
+			return nil
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		ct, err := tx.Exec(ctx, `
+			UPDATE dvr_recording
+			   SET output_path = $3
+			 WHERE id = $1
+			   AND output_path = $2
+			   AND state = 'scheduled'
+			   AND started_at IS NULL
+			   AND replaces_recording_id IS NULL
+			   AND scheduled_start > $4`,
+			id, oldOutputPath, newOutputPath, startsAfter)
+		if err != nil {
+			return translateDVRInsertError(err)
+		}
+		updated = ct.RowsAffected() == 1
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return updated, outcomeErr
+}

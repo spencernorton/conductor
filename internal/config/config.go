@@ -125,6 +125,17 @@ type Config struct {
 	DVRCapacityRetryInterval time.Duration
 	DVRCapacityRetryWindow   time.Duration
 
+	// CONDUCTOR_DVR_UNREQUESTED_RETENTION: how long completed DVR recordings
+	// that were NOT requested via Sonarr/Radarr (or that were removed from
+	// Sonarr/Radarr) remain in DVROutputDir before automatic deletion.
+	// Default 720h (30 days). Set to 0 to disable automatic expiry (-1 in struct).
+	// Recordings requested via Sonarr/Radarr stay until *arr confirms
+	// hasFile=true in the permanent library, then their staging copy is pruned
+	// after DVRImportedGrace.
+	DVRUnrequestedRetention time.Duration
+	DVRImportedGrace        time.Duration
+	DVRDiagnosticRetention  time.Duration
+
 	// Phase 4: transcoding + post-processing.
 
 	// CONDUCTOR_FFMPEG_BINARY: path to ffmpeg. Empty = "ffmpeg" on PATH.
@@ -361,6 +372,18 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	dvrUnrequestedRetention, err := envRetentionDuration("CONDUCTOR_DVR_UNREQUESTED_RETENTION", 30*24*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+	dvrImportedGrace, err := envDurationWithDefault("CONDUCTOR_DVR_IMPORTED_GRACE", 15*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	dvrDiagnosticRetention, err := envRetentionDuration("CONDUCTOR_DVR_DIAGNOSTIC_RETENTION", 24*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
 
 	ppvDisplayTimezone := envDefault("CONDUCTOR_PPV_DISPLAY_TIMEZONE", "America/Denver")
 	if _, err := time.LoadLocation(ppvDisplayTimezone); err != nil {
@@ -406,6 +429,9 @@ func Load() (Config, error) {
 		LiveStartupLead:          liveStartupLead,
 		DVRCapacityRetryInterval: dvrCapacityRetryInterval,
 		DVRCapacityRetryWindow:   dvrCapacityRetryWindow,
+		DVRUnrequestedRetention:  dvrUnrequestedRetention,
+		DVRImportedGrace:         dvrImportedGrace,
+		DVRDiagnosticRetention:   dvrDiagnosticRetention,
 		FFmpegBinary:             os.Getenv("CONDUCTOR_FFMPEG_BINARY"),
 		DiagDir:                  os.Getenv("CONDUCTOR_DIAG_DIR"),
 		CommskipURL:              os.Getenv("CONDUCTOR_COMMSKIP_URL"),
@@ -480,6 +506,50 @@ func parseIntDefault(s string, fallback int) int {
 // tell "not configured" from an explicit value. Unparseable is a hard error —
 // a mistyped padding value silently reverting to a default is exactly the kind
 // of thing nobody notices until a recording is lost.
+// envRetentionDuration parses a retention TTL env var. Unset returns def; an
+// explicit zero ("0" or "0s") returns -1 so callers can distinguish "disabled
+// by operator" from an uninitialized struct field. Negative values error.
+func envRetentionDuration(name string, def time.Duration) (time.Duration, error) {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def, nil
+	}
+	if v == "0" {
+		return -1, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", name, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s: must not be negative, got %s", name, d)
+	}
+	if d == 0 {
+		return -1, nil
+	}
+	return d, nil
+}
+
+// envDurationWithDefault parses a non-negative duration env var, returning def
+// when unset and rejecting malformed or negative values.
+func envDurationWithDefault(name string, def time.Duration) (time.Duration, error) {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def, nil
+	}
+	if v == "0" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", name, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s: must not be negative, got %s", name, d)
+	}
+	return d, nil
+}
+
 func envDuration(name string) (time.Duration, error) {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {

@@ -3,6 +3,15 @@
 All notable changes to Conductor are recorded here. Versions follow
 [semantic versioning](https://semver.org/); each release is a tag on `main`.
 
+## 0.64.0 — 2026-11-15
+
+- A background DVR retention and import-verification worker (`RetentionWorker`) now enforces two-tier recording retention on `CONDUCTOR_DVR_OUTPUT_DIR`:
+  - Recordings requested via Sonarr or Radarr (`reconcile:*`, `torznab:*`, or currently monitored in Sonarr/Radarr) remain preserved on disk until Sonarr/Radarr confirms `hasFile=true` in the permanent library, automatically re-queuing missed `DownloadedEpisodesScan` / `DownloadedMoviesScan` imports after a `6h` cooldown. Once `hasFile=true` is confirmed (and `CONDUCTOR_DVR_IMPORTED_GRACE`, default `15m`, has elapsed), the redundant staging `.ts` duplicate and empty directories are pruned and `dvr_recording` transitions to `historical`.
+  - Recordings not requested via Sonarr or Radarr (manual captures, `reconcile:plex-gap`, or items removed from Sonarr/Radarr) are retained for one month (`CONDUCTOR_DVR_UNREQUESTED_RETENTION`, default `720h` / `30d`) and then automatically expired.
+  - Stale `.partial` and `.superseded.<uuid>` diagnostic files with no active database dependency expire after `CONDUCTOR_DVR_DIAGNOSTIC_RETENTION` (default `24h`), while `.conductor-fs-id` volume identity markers are always preserved.
+- Movie DVR output paths now include the release year (`Movies/<Title> (<Year>)/<Title> (<Year>).ts`) from Radarr's wanted metadata or the programme's original air date, and unstarted scheduled bookings upgrade their `output_path` in place when naming metadata improves.
+- Daily Sonarr series (`seriesType == "daily"`) now emit broadcast air-date filenames (`TV/<Show>/Season <NN>/<Show>.<YYYY-MM-DD>.<SubTitle>.ts`) using Sonarr's local `airDate` so late-night broadcasts crossing midnight UTC parse and import cleanly.
+
 ## 0.63.0 — 2026-11-15
 
 - EPG transport and HTTP status errors now scrub URL userinfo, sensitive query parameters, and Xtream path credentials before logging, storing source health, or firing alerts, while `/xmltv.xml` caches rendered guide bytes behind its content `ETag`.

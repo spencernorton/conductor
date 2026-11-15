@@ -46,11 +46,13 @@ type MovieWant struct {
 type EpisodeWant struct {
 	SeriesTitle  string
 	SeriesYear   int
+	SeriesType   string // "standard" | "daily" | "anime"
 	TVDBID       int
 	Season       int
 	Episode      int
 	EpisodeTitle string
 	AirDate      *time.Time // episode air date (UTC), nil if unknown
+	AirDateLocal string     // Sonarr "YYYY-MM-DD" broadcast air date, or ""
 }
 
 // Match is one upcoming program the matcher believes satisfies a want.
@@ -84,6 +86,16 @@ type Match struct {
 	// title already normalizes onto the owned series key — there is no second
 	// title to prefer. Callers fall back to Program.Title.
 	ArrTitle string
+
+	// Year carries the movie release year from Radarr (movies only) so
+	// buildOutputPath emits "Movies/<Title> (<Year>)/<Title> (<Year>).ts",
+	// which Radarr's DownloadedMoviesScan requires when parsing bare titles.
+	Year int
+
+	// SeriesType and AirDateLocal carry Sonarr daily-series metadata so daily
+	// talk shows emit "<Show>.<YYYY-MM-DD>.<SubTitle>.ts" rather than SxxExx.
+	SeriesType   string
+	AirDateLocal string
 }
 
 // ProgramID is a convenience accessor used by dedup logic.
