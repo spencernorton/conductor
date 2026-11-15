@@ -2395,7 +2395,8 @@ func TestIntegrationTvsearchReturnsEpgHits(t *testing.T) {
 		`Conductor-DVR`,
 		`<guid isPermaLink="false">conductor-`,
 		`/dvr/schedule.torrent?`,
-		`apikey=test-key`,
+		`ec=`,
+		`sig=`,
 		`name="season" value="3"`,
 		`name="episode" value="7"`,
 		`<category>5000</category>`,
@@ -2404,6 +2405,9 @@ func TestIntegrationTvsearchReturnsEpgHits(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("tvsearch missing %q\n--- body ---\n%s", want, body)
 		}
+	}
+	if strings.Contains(body, "apikey=") || strings.Contains(body, "test-key") {
+		t.Errorf("tvsearch leaked raw indexer credential in RSS output:\n%s", body)
 	}
 
 	// Validate XML parses.

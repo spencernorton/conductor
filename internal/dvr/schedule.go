@@ -2,6 +2,7 @@ package dvr
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"net/http"
@@ -40,12 +41,32 @@ type ScheduleHandler struct {
 	// uses the same live reserve and padded window as runtime admission. nil
 	// uses store defaults for tests and in-process callers.
 	AdmissionPolicy *store.DVRAdmissionPolicy
+	// Now overrides wall-clock time for deterministic link-expiration tests.
+	Now func() time.Time
+}
+
+func (h *ScheduleHandler) now() time.Time {
+	if h.Now != nil {
+		return h.Now()
+	}
+	return time.Now()
 }
 
 func (h *ScheduleHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
-	if h.IndexerKey == "" || q.Get("apikey") != h.IndexerKey {
+	expectedKey := h.IndexerKey
+	if expectedKey == "" && h.Torznab != nil {
+		expectedKey = h.Torznab.APIKey
+	}
+	if h.Torznab == nil || expectedKey == "" {
+		http.Error(w, "invalid api key", http.StatusUnauthorized)
+		return
+	}
+	// Signed schedule links authenticate via HMAC (ec + sig) so member-visible
+	// enclosure URLs never carry the long-lived raw indexer credential. If a
+	// legacy cached link includes apikey=, still require it to match.
+	if q.Has("apikey") && subtle.ConstantTimeCompare([]byte(q.Get("apikey")), []byte(expectedKey)) != 1 {
 		http.Error(w, "invalid api key", http.StatusUnauthorized)
 		return
 	}
@@ -53,6 +74,10 @@ func (h *ScheduleHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	progID, chID, start, end, err := h.Torznab.VerifyScheduleURL(q.Get("ec"), q.Get("sig"))
 	if err != nil {
 		http.Error(w, "invalid schedule link: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !end.After(h.now()) {
+		http.Error(w, "schedule link expired", http.StatusGone)
 		return
 	}
 
