@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -150,6 +151,7 @@ type programDetail struct {
 	SubTitle           string
 	EpisodeNumXMLTV    string
 	EpisodeNumOnscreen string
+	OriginalAirDate    *time.Time
 	IsMovie            bool
 	ChannelName        string
 }
@@ -181,13 +183,13 @@ func (h *ScheduleHandler) lookupProgramRow(
 	row := h.DB.Pool.QueryRow(ctx, `
 		SELECT p.channel_id, p.start_at, p.end_at,
 		       p.title, p.sub_title, p.episode_num_xmltv, p.episode_num_onscreen,
-		       p.is_movie, c.name
+		       p.original_air_date, p.is_movie, c.name
 		  FROM epg_program p
 		  JOIN channel c ON c.id = p.channel_id
 		 WHERE p.id = $1`+canonicalClause, id)
 	err := row.Scan(&p.ChannelID, &p.StartAt, &p.EndAt,
 		&p.Title, &p.SubTitle, &p.EpisodeNumXMLTV, &p.EpisodeNumOnscreen,
-		&p.IsMovie, &p.ChannelName)
+		&p.OriginalAirDate, &p.IsMovie, &p.ChannelName)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return programDetail{}, store.ErrNotFound
 	}
@@ -261,9 +263,25 @@ func (h *ScheduleHandler) ScheduleReplacement(
 //   - <root>/TV/<Show>/<Show>.<starttime>.ts                     for unmatched
 //
 // These shapes match Sonarr's default folder format (no remap needed).
+func hasTrailingYearParens(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) < 6 || s[len(s)-1] != ')' || s[len(s)-6] != '(' {
+		return false
+	}
+	for i := len(s) - 5; i < len(s)-1; i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func buildOutputPath(root string, p programDetail, scheduledStart time.Time) string {
 	if p.IsMovie {
 		base := safeFilename(p.Title)
+		if p.OriginalAirDate != nil && p.OriginalAirDate.UTC().Year() >= 1900 && !hasTrailingYearParens(base) {
+			base = fmt.Sprintf("%s (%d)", base, p.OriginalAirDate.UTC().Year())
+		}
 		return filepath.Join(root, "Movies", base, base+".ts")
 	}
 	show := safeFilename(p.Title)

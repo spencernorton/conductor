@@ -13,7 +13,7 @@ import (
 
 // SonarrClient is a minimal read-only Sonarr v3 API client. It reads the
 // wanted/missing list (monitored episodes with no file) with the series
-// resource included, so each want carries its series title + TVDB id.
+// resource included, as well as series/episode state for DVR retention checks.
 type SonarrClient struct {
 	BaseURL string // e.g. http://192.0.2.10:8989
 	APIKey  string
@@ -28,16 +28,25 @@ func NewSonarrClient(baseURL, apiKey string) *SonarrClient {
 	}
 }
 
+type sonarrAltTitle struct {
+	Title string `json:"title"`
+}
+
 type sonarrSeries struct {
-	Title  string `json:"title"`
-	Year   int    `json:"year"`
-	TVDBID int    `json:"tvdbId"`
+	ID              int              `json:"id"`
+	Title           string           `json:"title"`
+	Year            int              `json:"year"`
+	TVDBID          int              `json:"tvdbId"`
+	SeriesType      string           `json:"seriesType"`
+	Monitored       bool             `json:"monitored"`
+	AlternateTitles []sonarrAltTitle `json:"alternateTitles"`
 }
 
 type sonarrEpisode struct {
 	Title         string        `json:"title"` // episode title
 	SeasonNumber  int           `json:"seasonNumber"`
 	EpisodeNumber int           `json:"episodeNumber"`
+	AirDate       string        `json:"airDate"` // "YYYY-MM-DD" broadcast date
 	AirDateUTC    *time.Time    `json:"airDateUtc"`
 	HasFile       bool          `json:"hasFile"`
 	Monitored     bool          `json:"monitored"`
@@ -73,11 +82,13 @@ func (c *SonarrClient) WantedEpisodes(ctx context.Context) ([]EpisodeWant, error
 			wants = append(wants, EpisodeWant{
 				SeriesTitle:  e.Series.Title,
 				SeriesYear:   e.Series.Year,
+				SeriesType:   e.Series.SeriesType,
 				TVDBID:       e.Series.TVDBID,
 				Season:       e.SeasonNumber,
 				Episode:      e.EpisodeNumber,
 				EpisodeTitle: e.Title,
 				AirDate:      e.AirDateUTC,
+				AirDateLocal: e.AirDate,
 			})
 		}
 		if page*pageSize >= pg.TotalRecords || len(pg.Records) == 0 {
@@ -85,6 +96,26 @@ func (c *SonarrClient) WantedEpisodes(ctx context.Context) ([]EpisodeWant, error
 		}
 	}
 	return wants, nil
+}
+
+// LibrarySeries returns every series tracked by Sonarr (monitored or not).
+func (c *SonarrClient) LibrarySeries(ctx context.Context) ([]sonarrSeries, error) {
+	var out []sonarrSeries
+	if err := c.get(ctx, "/api/v3/series", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SeriesEpisodes returns all episode records for one Sonarr series ID.
+func (c *SonarrClient) SeriesEpisodes(ctx context.Context, seriesID int) ([]sonarrEpisode, error) {
+	q := url.Values{}
+	q.Set("seriesId", strconv.Itoa(seriesID))
+	var out []sonarrEpisode
+	if err := c.get(ctx, "/api/v3/episode", q, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *SonarrClient) get(ctx context.Context, path string, q url.Values, out any) error {

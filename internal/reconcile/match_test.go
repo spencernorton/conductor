@@ -249,3 +249,54 @@ func TestOnscreenSEStillAutoRecordsWithoutAnEPGSubtitle(t *testing.T) {
 		t.Errorf("confidence %.2f should still auto-record", got[0].Confidence)
 	}
 }
+
+func TestBuildOutputPath_MovieIncludesYearAndAvoidsDoubleYear(t *testing.T) {
+	w := &Worker{OutputDir: "/dvr"}
+
+	p := prog("Sing", "", true)
+	p.TMDbID = 335797
+	matches := MatchMovies([]Program{p}, []MovieWant{{
+		TMDbID: 335797, Title: "Sing", Year: 2016,
+	}})
+	if len(matches) != 1 {
+		t.Fatalf("expected 1 movie match, got %d", len(matches))
+	}
+	want := "/dvr/Movies/Sing (2016)/Sing (2016).ts"
+	if got := w.outputFor(matches[0]); got != want {
+		t.Fatalf("movie outputFor = %q, want %q", got, want)
+	}
+
+	already := Match{Kind: "movie", ArrTitle: "Sing (2016)", Year: 2016, Program: p}
+	if got := w.outputFor(already); got != want {
+		t.Fatalf("movie with trailing year = %q, want %q", got, want)
+	}
+}
+
+func TestBuildOutputPath_DailySeriesUsesLocalBroadcastAirDate(t *testing.T) {
+	w := &Worker{OutputDir: "/dvr"}
+
+	// Late-night daily show: UTC start is 2026-11-13T04:35:00Z, while Sonarr's
+	// broadcast airDate is 2026-11-12. Output path must use 2026-11-12 so
+	// Sonarr's daily parser matches the right episode.
+	utcAir := time.Date(2026, 11, 13, 4, 35, 0, 0, time.UTC)
+	p := prog("Jimmy Kimmel Live!", "U2, Bobby Lee, Sheryl Crow", false)
+	p.StartAt = utcAir
+	p.EndAt = utcAir.Add(time.Hour)
+
+	matches := MatchEpisodes([]Program{p}, []EpisodeWant{{
+		SeriesTitle:  "Jimmy Kimmel Live!",
+		SeriesType:   "daily",
+		Season:       25,
+		Episode:      35,
+		EpisodeTitle: "U2, Bobby Lee, Sheryl Crow",
+		AirDate:      &utcAir,
+		AirDateLocal: "2026-11-12",
+	}})
+	if len(matches) != 1 {
+		t.Fatalf("expected 1 daily match, got %d", len(matches))
+	}
+	want := "/dvr/TV/Jimmy Kimmel Live!/Season 25/Jimmy Kimmel Live!.2026-11-12.U2, Bobby Lee, Sheryl Crow.ts"
+	if got := w.outputFor(matches[0]); got != want {
+		t.Fatalf("daily outputFor = %q, want %q", got, want)
+	}
+}

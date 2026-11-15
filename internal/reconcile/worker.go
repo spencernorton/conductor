@@ -443,6 +443,15 @@ func (w *Worker) scheduleOne(ctx context.Context, m Match) bool {
 		return false
 	}
 	if rec.ID != intentID {
+		if rec.State == "scheduled" && rec.StartedAt == nil &&
+			rec.ReplacesRecordingID == nil && rec.OutputPath != output {
+			if ok, upErr := w.DB.UpdateUnstartedDVRRecordingOutputPath(
+				ctx, rec.ID, rec.OutputPath, output, time.Now().Add(cancelGuard),
+			); upErr == nil && ok {
+				w.Logger.Info("reconcile: updated scheduled recording output path",
+					"id", rec.ID, "want", m.WantLabel, "old_output", rec.OutputPath, "output", output)
+			}
+		}
 		// Exact-airing retry confirmed an existing booking from an earlier cycle;
 		// do not count re-confirmations against MaxPerCycle.
 		w.Logger.Debug("reconcile: recording already booked",
@@ -477,9 +486,10 @@ func (w *Worker) outputFor(m Match) string {
 
 // buildOutputPath mirrors internal/dvr/schedule.go's layout so recordings
 // land where Sonarr/Radarr's library scan expects them:
-//   - Movies/<Title>/<Title>.ts
-//   - TV/<Show>/Season NN/<Show>.SxxExx.ts
-//   - TV/<Show>/<Show>.<timestamp>.ts   (episode with no S/E)
+//   - Movies/<Title> (<Year>)/<Title> (<Year>).ts
+//   - TV/<Show>/Season NN/<Show>.<YYYY-MM-DD>.<SubTitle>.ts (daily series)
+//   - TV/<Show>/Season NN/<Show>.SxxExx.<SubTitle>.ts       (standard series)
+//   - TV/<Show>/<Show>.<timestamp>.ts                       (episode with no S/E)
 func (w *Worker) buildOutputPath(m Match, onscreenSE string) string {
 	root := w.OutputDir
 	// Prefer the *arr's title: it is what *arr resolves the series from on
@@ -491,9 +501,29 @@ func (w *Worker) buildOutputPath(m Match, onscreenSE string) string {
 	}
 	if m.Program.IsMovie {
 		base := safeFilename(title)
+		year := m.Year
+		if year <= 0 && m.Program.OriginalAirDate != nil {
+			year = m.Program.OriginalAirDate.UTC().Year()
+		}
+		if year >= 1900 && !hasTrailingYearParens(base) {
+			base = fmt.Sprintf("%s (%d)", base, year)
+		}
 		return filepath.Join(root, "Movies", base, base+".ts")
 	}
 	show := safeFilename(title)
+	if strings.EqualFold(m.SeriesType, "daily") {
+		if dailyDate := dailyAirDateFor(m); dailyDate != "" {
+			name := show + "." + dailyDate
+			if m.Program.SubTitle != "" {
+				name += "." + safeFilename(m.Program.SubTitle)
+			}
+			if m.Season > 0 {
+				seasonDir := fmt.Sprintf("Season %02d", m.Season)
+				return filepath.Join(root, "TV", show, seasonDir, name+".ts")
+			}
+			return filepath.Join(root, "TV", show, name+".ts")
+		}
+	}
 	if onscreenSE != "" {
 		seasonDir := fmt.Sprintf("Season %02d", m.Season)
 		name := show + "." + onscreenSE
@@ -504,6 +534,44 @@ func (w *Worker) buildOutputPath(m Match, onscreenSE string) string {
 	}
 	return filepath.Join(root, "TV", show,
 		show+"."+m.Program.StartAt.UTC().Format("20060102T150405")+".ts")
+}
+
+func hasTrailingYearParens(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) < 6 || s[len(s)-1] != ')' || s[len(s)-6] != '(' {
+		return false
+	}
+	for i := len(s) - 5; i < len(s)-1; i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isISODate(s string) bool {
+	if len(s) != 10 || s[4] != '-' || s[7] != '-' {
+		return false
+	}
+	for i, ch := range s {
+		if i == 4 || i == 7 {
+			continue
+		}
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func dailyAirDateFor(m Match) string {
+	if d := strings.TrimSpace(m.AirDateLocal); isISODate(d) {
+		return d
+	}
+	if m.Program.OriginalAirDate != nil {
+		return m.Program.OriginalAirDate.UTC().Format("2006-01-02")
+	}
+	return ""
 }
 
 // requestedBy tags the dvr_recording with the reconciler source that
