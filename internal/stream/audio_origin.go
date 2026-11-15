@@ -40,7 +40,7 @@ const (
 	// ceiling while allowing a high-bitrate, sparse-audio mux to contribute eight
 	// PES clocks. The wall cap still leaves the explicit FFmpeg reserve inside
 	// the four-second per-source startup deadline.
-	maxAudioOriginProbeBytes = 1536 * 1024
+	maxAudioOriginProbeBytes = 1920 * 1024
 	maxAudioOriginProbeWall  = 1500 * time.Millisecond
 	minFFmpegStartupReserve  = 2 * time.Second
 )
@@ -153,21 +153,24 @@ func (r *audioOriginPairRing) stableMedian(initial time.Duration) (time.Duration
 }
 
 func (p *audioOriginProbe) feedTimeline(data []byte, observedAt time.Time) {
+	if len(data) == 0 {
+		return
+	}
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+	p.timeline.mu.Lock()
+	defer p.timeline.mu.Unlock()
+	p.timeline.unsafeCurrentFeed = false
+	p.timeline.unsafeCurrentAVFault = nil
 	for len(data) > 0 {
 		take := min(len(data), tsPacketSize)
-		part := data[:take]
-		p.timeline.mu.Lock()
 		audioBefore := p.timeline.audio[0].samples
-		p.timeline.mu.Unlock()
-
-		p.timeline.feedAt(part, observedAt)
-
-		p.timeline.mu.Lock()
+		p.timeline.feedLocked(data[:take], observedAt)
 		if p.timeline.audio[0].samples > audioBefore && p.timeline.video.have {
 			p.pairs.record(ptsSignedDuration(
 				p.timeline.audio[0].lastRaw, p.timeline.video.maxRaw))
 		}
-		p.timeline.mu.Unlock()
 		data = data[take:]
 	}
 }
@@ -285,12 +288,25 @@ func (p *audioOriginProbe) decision() (bool, time.Duration, error) {
 		return false, 0, nil
 	}
 
-	initialAbs, medianAbs := absoluteDuration(initial), absoluteDuration(pairedMedian)
+	initialAbs := absoluteDuration(initial)
+	finalAbs := absoluteDuration(final)
+	medianAbs := absoluteDuration(pairedMedian)
 	if initialAbs > maxCorrectedAudioOrigin || medianAbs > maxCorrectedAudioOrigin {
 		return false, 0, audioOriginRefusal("outside_window",
 			"audio origin lies outside the correction window")
 	}
-	if initialAbs < maxPreservedAudioOrigin || medianAbs < maxPreservedAudioOrigin ||
+	if absoluteDuration(drift) >= defaultAVContinuityPolicy().driftThreshold {
+		return false, 0, nil
+	}
+	// When normal mux interleave straddles the 2s preserved/corrected boundary
+	// (for example initial=+2.10s with pairedMedian=+1.92s, or initial=+1.94s
+	// with final=+2.04s), zero-correction is rejected by the downstream safety
+	// gate. Once the eight-sample window proves a stable, same-sign constant
+	// offset, apply -initial rather than stalling until byte_cap.
+	if (initialAbs < maxPreservedAudioOrigin &&
+		finalAbs < maxPreservedAudioOrigin &&
+		medianAbs < maxPreservedAudioOrigin) ||
+		initial == 0 || pairedMedian == 0 ||
 		(initial < 0) != (pairedMedian < 0) {
 		return false, 0, nil
 	}
@@ -331,7 +347,16 @@ func preflightTranscodeAudioOrigin(
 	probe := &audioOriginProbe{}
 	buf := make([]byte, chunkSize)
 	for {
-		n, readErr := attempt.Read(buf)
+		// Never read past the exact byte ceiling while bytes remain in the
+		// probe budget; otherwise a 32 KiB socket read near the ceiling trips
+		// byte_cap before inspecting the packets that still fit inside the cap.
+		readBuf := buf
+		if remaining := maxAudioOriginProbeBytes - len(probe.buffer); remaining > 0 && remaining < len(buf) {
+			readBuf = buf[:remaining]
+		} else if remaining <= 0 {
+			readBuf = buf[:1]
+		}
+		n, readErr := attempt.Read(readBuf)
 		if n > 0 {
 			ready, correction, probeErr := probe.push(buf[:n], time.Now())
 			if probeErr != nil {
