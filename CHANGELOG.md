@@ -3,6 +3,18 @@
 All notable changes to Conductor are recorded here. Versions follow
 [semantic versioning](https://semver.org/); each release is a tag on `main`.
 
+## 0.63.0 — 2026-11-15
+
+- EPG transport and HTTP status errors now scrub URL userinfo, sensitive query parameters, and Xtream path credentials before logging, storing source health, or firing alerts, while `/xmltv.xml` caches rendered guide bytes behind its content `ETag`.
+- Torznab schedule enclosures (`/dvr/schedule.torrent`) no longer embed the raw `apikey=` parameter; downloads authenticate through constant-time scoped HMAC verification (`hmac.Equal`) and return `410 Gone` once the target airing ends.
+- The stream audio-origin probe resolves offsets straddling the 2.0-second preservation/correction boundary instead of stalling until the probe byte ceiling, raises the probe ceiling from `1536 KiB` to `1920 KiB` for high-bitrate multi-audio MPEG-TS feeds, and batches timeline mutex acquisition per chunk.
+- `pumpOutputClock.joinOffset` credits delivered audio deficit (`maxPTS + cadence - audioEnd`) when a replacement upstream epoch arrives A/V-aligned, preventing cascading `output_clock_unbounded_lead` restart refusals after transient audio starvation.
+- DVR output directories write a durable `.conductor-fs-id` (`vol:<uuid>`) volume marker, cryptographically migrate legacy `dev:<st_dev>` owners across host reboots once a validated artifact's SHA-256 matches on the mounted volume, and store `artifact_stat_sig` for fast startup checks so imported/removed files demote cleanly to `missing`.
+- The DVR reconciler counts only newly inserted bookings against `MaxPerCycle` and logs idempotent skips at `Debug`.
+- Prometheus `/metrics` caches database-backed gauges for 10 seconds and consolidates canonical EPG health queries.
+- The enrichment worker purges expired `tmdb_response_cache` and `tvdb_response_cache` entries plus `dvr_indexer_search_log` rows older than 30 days once per hour, and migration `0029` tunes autovacuum thresholds on high-churn tables.
+- `Dockerfile.cuda` upgrades the GPU runtime base image to `nvidia/cuda:12.6.3-runtime-ubuntu24.04` (`FFmpeg 6.1`).
+
 ## 0.62.0 — 2026-11-14
 
 - The sports poster worker now runs hourly (`CONDUCTOR_POSTER_INTERVAL`, default `1h`) and batches up to six image-generation requests per pass (`CONDUCTOR_POSTER_MAX_PER_PASS`, default `6`). Total hourly poster throughput is unchanged, while on-demand diffusion backends wake once per hour instead of every 10 minutes.
