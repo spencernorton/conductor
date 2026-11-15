@@ -12,20 +12,20 @@
 //
 // Architecture overview (also in docs/enhancements.md §10):
 //
-//   1. Operator adds Conductor as a Torznab indexer in Prowlarr at LOW
-//      priority. Sonarr/Radarr only fall through to Conductor when no
-//      higher-priority indexer has the file — gives the user's
-//      "can't find online" condition for free.
-//   2. Sonarr searches → /indexer/torznab/api?t=tvsearch&q=…
-//   3. Conductor returns matching upcoming EPG programs as Torznab <item>s.
-//   4. Sonarr "grabs" a result → /dvr/schedule.torrent?ec=<signed>
-//   5. Conductor inserts a dvr_recording row (state=scheduled) and returns a
-//      tiny placeholder .torrent.
-//   6. Background scheduler picks up the recording at start_time-30s,
-//      opens the channel via stream.Pool.ServeWriter, captures bytes for
-//      the program window, writes to <CONDUCTOR_DVR_OUTPUT_DIR>/Show/...
-//   7. *arr's library import / completed-download-handling picks up the
-//      finished file.
+//  1. Operator adds Conductor as a Torznab indexer in Prowlarr at LOW
+//     priority. Sonarr/Radarr only fall through to Conductor when no
+//     higher-priority indexer has the file — gives the user's
+//     "can't find online" condition for free.
+//  2. Sonarr searches → /indexer/torznab/api?t=tvsearch&q=…
+//  3. Conductor returns matching upcoming EPG programs as Torznab <item>s.
+//  4. Sonarr "grabs" a result → /dvr/schedule.torrent?ec=<signed>
+//  5. Conductor inserts a dvr_recording row (state=scheduled) and returns a
+//     tiny placeholder .torrent.
+//  6. Background scheduler picks up the recording at start_time-30s,
+//     opens the channel via stream.Pool.ServeWriter, captures bytes for
+//     the program window, writes to <CONDUCTOR_DVR_OUTPUT_DIR>/Show/...
+//  7. *arr's library import / completed-download-handling picks up the
+//     finished file.
 //
 // Auth: indexer endpoints are gated by CONDUCTOR_DVR_INDEXER_KEY (passed
 // as `apikey=…` query param, the Torznab convention). Distinct from the
@@ -36,6 +36,7 @@ package dvr
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
@@ -55,10 +56,10 @@ import (
 
 // Torznab is the HTTP surface mounted at /indexer/torznab/api.
 type Torznab struct {
-	DB         *store.DB
-	BaseURL    string // e.g. http://192.0.2.12:8409
-	APIKey     string // shared with Prowlarr
-	SignKey    []byte // HMAC key for signed download URLs
+	DB          *store.DB
+	BaseURL     string // e.g. http://192.0.2.12:8409
+	APIKey      string // shared with Prowlarr
+	SignKey     []byte // HMAC key for signed download URLs
 	IndexerName string
 }
 
@@ -84,7 +85,7 @@ func New(db *store.DB, baseURL, apiKey, name string) *Torznab {
 func (t *Torznab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
-	if t.APIKey == "" || q.Get("apikey") != t.APIKey {
+	if t.APIKey == "" || subtle.ConstantTimeCompare([]byte(q.Get("apikey")), []byte(t.APIKey)) != 1 {
 		http.Error(w, `<?xml version="1.0"?><error code="100" description="Invalid API Key"/>`,
 			http.StatusUnauthorized)
 		return
@@ -178,32 +179,32 @@ func (t *Torznab) search(w http.ResponseWriter, r *http.Request, kind string) {
 // ─────────────────────── output ───────────────────────
 
 type torznabRSS struct {
-	XMLName xml.Name `xml:"rss"`
-	Version string   `xml:"version,attr"`
-	NSAtom  string   `xml:"xmlns:atom,attr"`
-	NSTorz  string   `xml:"xmlns:torznab,attr"`
+	XMLName xml.Name       `xml:"rss"`
+	Version string         `xml:"version,attr"`
+	NSAtom  string         `xml:"xmlns:atom,attr"`
+	NSTorz  string         `xml:"xmlns:torznab,attr"`
 	Channel torznabChannel `xml:"channel"`
 }
 
 type torznabChannel struct {
-	Title       string         `xml:"title"`
-	Description string         `xml:"description"`
-	Link        string         `xml:"link"`
-	Language    string         `xml:"language"`
-	Items       []torznabItem  `xml:"item"`
+	Title       string        `xml:"title"`
+	Description string        `xml:"description"`
+	Link        string        `xml:"link"`
+	Language    string        `xml:"language"`
+	Items       []torznabItem `xml:"item"`
 }
 
 type torznabItem struct {
-	Title       string         `xml:"title"`
-	GUID        torznabGUID    `xml:"guid"`
-	Type        string         `xml:"type"`
-	PubDate     string         `xml:"pubDate"`
-	Category    []int          `xml:"category"`
-	Link        string         `xml:"link"`
-	Comments    string         `xml:"comments,omitempty"`
-	Description string         `xml:"description,omitempty"`
+	Title       string           `xml:"title"`
+	GUID        torznabGUID      `xml:"guid"`
+	Type        string           `xml:"type"`
+	PubDate     string           `xml:"pubDate"`
+	Category    []int            `xml:"category"`
+	Link        string           `xml:"link"`
+	Comments    string           `xml:"comments,omitempty"`
+	Description string           `xml:"description,omitempty"`
 	Enclosure   torznabEnclosure `xml:"enclosure"`
-	Attrs       []torznabAttr  `xml:"torznab:attr"`
+	Attrs       []torznabAttr    `xml:"torznab:attr"`
 }
 
 type torznabGUID struct {
@@ -313,9 +314,10 @@ func (t *Torznab) itemFromHit(h store.EPGSearchHit) torznabItem {
 
 // buildReleaseTitle synthesizes a release name in the *arr-friendly form so
 // Sonarr/Radarr's parsers recognize season+episode+year. Examples:
-//   "The Bear S03E07 Conductor-DVR FX 1080p"
-//   "Heat 1995 Conductor-DVR AMC 1080p"
-//   "Denver Broncos at Kansas City Chiefs Conductor-DVR ESPN 1080p"
+//
+//	"The Bear S03E07 Conductor-DVR FX 1080p"
+//	"Heat 1995 Conductor-DVR AMC 1080p"
+//	"Denver Broncos at Kansas City Chiefs Conductor-DVR ESPN 1080p"
 func buildReleaseTitle(h store.EPGSearchHit) string {
 	parts := []string{cleanForTitle(h.Title)}
 	if h.EpisodeNumOnscreen != "" {
@@ -358,7 +360,6 @@ func (t *Torznab) signedScheduleURL(h store.EPGSearchHit) string {
 	v := url.Values{}
 	v.Set("ec", enc)
 	v.Set("sig", sig)
-	v.Set("apikey", t.APIKey)
 	return t.BaseURL + "/dvr/schedule.torrent?" + v.Encode()
 }
 
@@ -371,13 +372,18 @@ func (t *Torznab) SignedScheduleURLForTest(h store.EPGSearchHit) string {
 // VerifyScheduleURL is the inverse of signedScheduleURL — used by the
 // /dvr/schedule.torrent handler to validate the request.
 func (t *Torznab) VerifyScheduleURL(ec, sig string) (programID, channelID uuid.UUID, start, end time.Time, err error) {
+	if t == nil || len(t.SignKey) == 0 {
+		err = fmt.Errorf("schedule verifier not configured")
+		return
+	}
 	raw, derr := base64.RawURLEncoding.DecodeString(ec)
 	if derr != nil {
 		err = fmt.Errorf("decode ec: %w", derr)
 		return
 	}
 	payload := string(raw)
-	if hmacSign(t.SignKey, payload) != sig {
+	expectedSig := hmacSign(t.SignKey, payload)
+	if !hmac.Equal([]byte(expectedSig), []byte(sig)) {
 		err = fmt.Errorf("signature mismatch")
 		return
 	}

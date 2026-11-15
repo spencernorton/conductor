@@ -26,8 +26,11 @@ func TestSignedScheduleURLRoundtrip(t *testing.T) {
 	if !strings.HasPrefix(url, "http://test.local:8409/dvr/schedule.torrent?") {
 		t.Fatalf("unexpected URL: %s", url)
 	}
-	if !strings.Contains(url, "ec=") || !strings.Contains(url, "sig=") || !strings.Contains(url, "apikey=indexer-key-123") {
-		t.Errorf("URL missing required query params: %s", url)
+	if !strings.Contains(url, "ec=") || !strings.Contains(url, "sig=") {
+		t.Errorf("URL missing required signed query params: %s", url)
+	}
+	if strings.Contains(url, "apikey=") || strings.Contains(url, "indexer-key-123") {
+		t.Errorf("signed schedule URL must not embed raw indexer credential: %s", url)
 	}
 
 	// Extract ec + sig and round-trip.
