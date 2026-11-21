@@ -3,7 +3,7 @@
 // EPG injector.
 //
 // Why TheSportsDB:
-//   - free tier (key "123" or "3") works without an account
+//   - free tier (key "123"; legacy "3" was retired upstream) works without an account
 //   - covers NFL/NBA/NHL/MLB/MLS, top European football, F1, PGA,
 //     boxing/MMA — the leagues we actually want
 //   - exposes per-event TV-station strings, which we use to route the
@@ -33,8 +33,8 @@ import (
 
 // Client wraps TheSportsDB's free JSON API.
 type Client struct {
-	BaseURL string // default: https://www.thesportsdb.com/api/v1/json/3
-	APIKey  string // default: "3" (free tier key); paid keys go here
+	BaseURL string // default: https://www.thesportsdb.com/api/v1/json
+	APIKey  string // default: "123" (free tier key); paid keys go here
 	HTTP    *http.Client
 }
 
@@ -42,7 +42,7 @@ type Client struct {
 // the free public key.
 func NewClient(apiKey string) *Client {
 	if apiKey == "" {
-		apiKey = "3"
+		apiKey = "123"
 	}
 	return &Client{
 		BaseURL: "https://www.thesportsdb.com/api/v1/json",

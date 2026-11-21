@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+
+	"github.com/spencercnorton/conductor/internal/store"
 )
 
 func TestRemoveArtifactFileAndEmptyParents_PreservesRootAndVolumeMarker(t *testing.T) {
@@ -65,5 +67,57 @@ func TestIsDiagnosticArtifactName(t *testing.T) {
 		if got := isDiagnosticArtifactName(tc.name); got != tc.want {
 			t.Errorf("isDiagnosticArtifactName(%q) = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestEvaluateRetention_UnmonitoredArrCaptureFallsBackToTTL(t *testing.T) {
+	movieItem := store.DVRCompletedArtifact{
+		Recording: store.DVRRecording{
+			Title:       "Sample Movie",
+			IsMovie:     true,
+			RequestedBy: "reconcile:radarr",
+		},
+		TMDbID: 42,
+	}
+	dec, _ := evaluateMovieRetention(
+		movieItem, "Sample Movie (2024)", 2024, true,
+		[]radarrMovie{{ID: 1, Title: "Sample Movie", Year: 2024, TMDbID: 42, Monitored: false, HasFile: false}},
+		nil,
+	)
+	if dec != decisionUnrequestedTTL {
+		t.Fatalf("unmonitored Radarr movie got decision %v, want decisionUnrequestedTTL", dec)
+	}
+
+	epItem := store.DVRCompletedArtifact{
+		Recording: store.DVRRecording{
+			Title:              "Sample Show",
+			EpisodeNumOnscreen: "S01E02",
+			RequestedBy:        "reconcile:sonarr",
+		},
+		TVDBID: 99,
+	}
+	dec, _ = evaluateEpisodeRetention(
+		epItem, "Sample Show", 0, true,
+		[]sonarrSeries{{ID: 7, Title: "Sample Show", TVDBID: 99, Monitored: true}},
+		nil,
+		func(seriesID int) ([]sonarrEpisode, error) {
+			return []sonarrEpisode{{SeasonNumber: 1, EpisodeNumber: 2, Monitored: false, HasFile: false}}, nil
+		},
+	)
+	if dec != decisionUnrequestedTTL {
+		t.Fatalf("unmonitored Sonarr episode got decision %v, want decisionUnrequestedTTL", dec)
+	}
+
+	// Unmatched episode on a requested capture still fails safe to preservation.
+	dec, _ = evaluateEpisodeRetention(
+		epItem, "Sample Show", 0, true,
+		[]sonarrSeries{{ID: 7, Title: "Sample Show", TVDBID: 99, Monitored: true}},
+		nil,
+		func(seriesID int) ([]sonarrEpisode, error) {
+			return nil, nil
+		},
+	)
+	if dec != decisionKeepRequested {
+		t.Fatalf("unmatched Sonarr-requested episode got decision %v, want decisionKeepRequested", dec)
 	}
 }

@@ -153,3 +153,10 @@ func TestSeasonNext_NullEvents(t *testing.T) {
 		t.Errorf("want 0 events, got %d", len(events))
 	}
 }
+
+func TestNewClient_DefaultsToPublicKey123(t *testing.T) {
+	c := NewClient("")
+	if c.APIKey != "123" {
+		t.Fatalf("NewClient(\"\").APIKey = %q, want \"123\"", c.APIKey)
+	}
+}

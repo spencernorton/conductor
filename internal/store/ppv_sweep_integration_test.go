@@ -180,6 +180,18 @@ func TestIntegrationExtendPPVLiveRow(t *testing.T) {
 	}
 	liveHash := fmt.Sprintf("ppv-parse:xtream:5:%d:Fight", liveStart.Unix())
 	seed(liveStart, liveEnd, liveHash)
+	// Seed an adjacent ppv-off placeholder starting immediately at liveEnd,
+	// matching injectOffSlot's production layout; extending past liveEnd must
+	// clear the encroached placeholder in the same deferred transaction rather
+	// than tripping epg_program_no_ppv_off_real_overlap (23P01).
+	adjOff := store.EPGProgram{
+		ChannelID: ch.ID, StartAt: liveEnd, EndAt: liveEnd.Add(2 * time.Hour),
+		Title: "No Live Event", SourceHash: fmt.Sprintf("ppv-off:xtream:5:%d", liveEnd.Unix()),
+		SourcePriority: store.PriorityPPVOff,
+	}
+	if _, err := db.UpsertEPGProgram(ctx, adjOff); err != nil {
+		t.Fatalf("seed adjacent ppv-off: %v", err)
+	}
 
 	// "now" is in the final stretch: end (00:00) < now+30m.
 	now := liveEnd.Add(-15 * time.Minute) // 23:45
@@ -300,6 +312,14 @@ func TestIntegrationPreservePPVLiveOverrunIsExactAndNonInserting(t *testing.T) {
 	observedAt := now
 	if end, active, err := db.ActivePPVLiveOverrunEnd(ctx, ch.ID, start, exactHash, now, hardEnd); err != nil || !active || !end.Equal(now.Add(10*time.Minute)) {
 		t.Fatalf("active probe = (%v, %v, %v)", end, active, err)
+	}
+	adjOverrunOff := store.EPGProgram{
+		ChannelID: ch.ID, StartAt: now.Add(10 * time.Minute), EndAt: now.Add(3 * time.Hour),
+		Title: "No Live Event", SourceHash: fmt.Sprintf("ppv-off:xtream:606185:%d", now.Add(10*time.Minute).Unix()),
+		SourcePriority: store.PriorityPPVOff,
+	}
+	if _, err := db.UpsertEPGProgram(ctx, adjOverrunOff); err != nil {
+		t.Fatalf("seed adjacent overrun ppv-off: %v", err)
 	}
 	newEnd := now.Add(90 * time.Minute)
 	end, deleted, kept, err := db.PreservePPVLiveOverrunForChannel(

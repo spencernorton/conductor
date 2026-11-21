@@ -1665,7 +1665,8 @@ func (db *DB) ExtendPPVLiveRowEnd(ctx context.Context, channelID uuid.UUID, star
 		if claimErr != nil || !applied {
 			return claimErr
 		}
-		tag, execErr := tx.Exec(ctx, `
+		var updatedEnd time.Time
+		execErr := tx.QueryRow(ctx, `
 			UPDATE epg_program
 			   SET end_at = LEAST($5, $6),
 			       is_canonical = false
@@ -1676,13 +1677,30 @@ func (db *DB) ExtendPPVLiveRowEnd(ctx context.Context, channelID uuid.UUID, star
 			   AND source_priority = $7
 			   AND end_at < $4
 			   AND $5 > end_at
-			   AND $6 > end_at`,
-			channelID, startAt, sourceHash, triggerBefore, newEnd, hardEnd, PriorityPPVSync)
-		if execErr != nil {
+			   AND $6 > end_at
+			 RETURNING end_at`,
+			channelID, startAt, sourceHash, triggerBefore, newEnd, hardEnd, PriorityPPVSync).Scan(&updatedEnd)
+		if execErr != nil && !errors.Is(execErr, pgx.ErrNoRows) {
 			return execErr
 		}
-		extended = tag.RowsAffected()
-		return finalizeEPGChannelMutation(ctx, tx, channelID, extended > 0)
+		offDeleted := int64(0)
+		if execErr == nil {
+			extended = 1
+			// Clear weaker ppv-off placeholders now overlapped by the extended
+			// live window inside the same deferred-constraint transaction;
+			// ppvsync re-injects post-event off blocks immediately afterward.
+			offTag, delErr := tx.Exec(ctx, `
+				DELETE FROM epg_program
+				 WHERE channel_id = $1
+				   AND source_hash LIKE 'ppv-off:%'
+				   AND start_at < $3 AND end_at > $2`,
+				channelID, startAt, updatedEnd)
+			if delErr != nil {
+				return delErr
+			}
+			offDeleted = offTag.RowsAffected()
+		}
+		return finalizeEPGChannelMutation(ctx, tx, channelID, extended > 0 || offDeleted > 0)
 	})
 	return extended, applied, err
 }
@@ -1794,6 +1812,15 @@ func (db *DB) PreservePPVLiveOverrunForChannel(
 				return err
 			}
 		}
+		offTag, err := tx.Exec(ctx, `
+			DELETE FROM epg_program
+			 WHERE channel_id = $1
+			   AND source_hash LIKE 'ppv-off:%'
+			   AND start_at < $3 AND end_at > $2`,
+			channelID, startAt, endAt)
+		if err != nil {
+			return err
+		}
 		tag, err := tx.Exec(ctx, `
 			DELETE FROM epg_program
 			 WHERE channel_id = $1
@@ -1804,7 +1831,7 @@ func (db *DB) PreservePPVLiveOverrunForChannel(
 			return err
 		}
 		deleted = tag.RowsAffected()
-		return finalizeEPGChannelMutation(ctx, tx, channelID, deleted > 0 || kept)
+		return finalizeEPGChannelMutation(ctx, tx, channelID, deleted > 0 || offTag.RowsAffected() > 0 || kept)
 	})
 	return endAt, deleted, kept, err
 }

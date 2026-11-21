@@ -3,6 +3,12 @@
 All notable changes to Conductor are recorded here. Versions follow
 [semantic versioning](https://semver.org/); each release is a tag on `main`.
 
+## 0.64.1 — 2026-11-21
+
+- When an episode or movie previously captured for Sonarr or Radarr (`reconcile:*`, `torznab:*`) remains unimported (`hasFile=false`) and is explicitly unmonitored in Sonarr or Radarr, `RetentionWorker` now transitions it to the unrequested retention window (`CONDUCTOR_DVR_UNREQUESTED_RETENTION`, default `720h`) instead of retrying `ArrImport` indefinitely; captures whose episode metadata is not yet matched in Sonarr still remain preserved.
+- `ExtendPPVLiveRowEnd` and `PreservePPVLiveOverrunForChannel` now clear overlapping weaker `ppv-off:` placeholder blocks inside the same channel-locked deferred transaction before committing an extended live PPV window, avoiding `epg_program_no_ppv_off_real_overlap` (`23P01`) rollbacks when a live event extends into an adjacent post-event placeholder.
+- `sports.NewClient` now defaults to TheSportsDB's active public test key (`"123"`) instead of the retired `"3"` key when `CONDUCTOR_SPORTS_API_KEY` is unset.
+
 ## 0.64.0 — 2026-11-15
 
 - A background DVR retention and import-verification worker (`RetentionWorker`) now enforces two-tier recording retention on `CONDUCTOR_DVR_OUTPUT_DIR`:

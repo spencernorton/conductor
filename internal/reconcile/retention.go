@@ -307,10 +307,10 @@ func evaluateMovieRetention(
 		if m.HasFile {
 			return decisionPruneImported, "movie confirmed in Radarr library (hasFile=true)"
 		}
-		if m.Monitored || isArrRequested(rec.RequestedBy) {
+		if m.Monitored {
 			return decisionKeepRequested, ""
 		}
-		return decisionUnrequestedTTL, "unrequested and unmonitored in Radarr"
+		return decisionUnrequestedTTL, "movie unmonitored in Radarr"
 	}
 	if isArrRequested(rec.RequestedBy) {
 		return decisionKeepRequested, ""
@@ -348,10 +348,10 @@ func evaluateEpisodeRetention(
 			if ep.HasFile {
 				return decisionPruneImported, "episode confirmed in Sonarr library (hasFile=true)"
 			}
-			if (series.Monitored && ep.Monitored) || isArrRequested(rec.RequestedBy) {
+			if series.Monitored && ep.Monitored {
 				return decisionKeepRequested, ""
 			}
-			return decisionUnrequestedTTL, "unrequested and unmonitored in Sonarr"
+			return decisionUnrequestedTTL, "episode unmonitored in Sonarr"
 		}
 		if isArrRequested(rec.RequestedBy) {
 			return decisionKeepRequested, ""
