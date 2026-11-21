@@ -163,6 +163,7 @@ func TestIntegrationDVRRetentionPolicyAndImportSelfHeal(t *testing.T) {
 	}
 
 	var sonarrFail atomic.Bool
+	var sisterWivesUnmonitored atomic.Bool
 	var importScans atomic.Int32
 	var lastScannedPath atomic.Value
 
@@ -185,7 +186,7 @@ func TestIntegrationDVRRetentionPolicyAndImportSelfHeal(t *testing.T) {
 				})
 			case "20":
 				_ = json.NewEncoder(w).Encode([]sonarrEpisode{
-					{SeasonNumber: 21, EpisodeNumber: 1, Title: "Premiere", HasFile: false, Monitored: true},
+					{SeasonNumber: 21, EpisodeNumber: 1, Title: "Premiere", HasFile: false, Monitored: !sisterWivesUnmonitored.Load()},
 				})
 			default:
 				_ = json.NewEncoder(w).Encode([]sonarrEpisode{})
@@ -292,6 +293,27 @@ func TestIntegrationDVRRetentionPolicyAndImportSelfHeal(t *testing.T) {
 		if !rec.ArtifactCurrent || rec.ArtifactState != "validated" {
 			t.Fatalf("preserved recording %s has current=%v state=%q, want true/validated", id, rec.ArtifactCurrent, rec.ArtifactState)
 		}
+	}
+
+	// Pass 3: Operator unmonitors Sister Wives S21E01 in Sonarr while hasFile=false ->
+	// 45d-old capture transitions to the 30d unrequested policy without firing ArrImport and expires cleanly.
+	sisterWivesUnmonitored.Store(true)
+	sum3, err := worker.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("RunOnce pass 3 failed: %v", err)
+	}
+	if sum3.ExpiredUnrequested != 1 || sum3.RetriedImports != 0 || importScans.Load() != 1 {
+		t.Fatalf("unexpected pass 3 summary=%+v scans=%d", sum3, importScans.Load())
+	}
+	if _, err := os.Stat(pendingEpPath); !os.IsNotExist(err) {
+		t.Fatalf("unmonitored 45d capture should be expired, stat err=%v", err)
+	}
+	unmonRec, err := db.GetDVRRecording(ctx, pendingEp.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unmonRec.ArtifactCurrent || unmonRec.ArtifactState != "historical" {
+		t.Fatalf("unmonitored expired recording current=%v state=%q, want false/historical", unmonRec.ArtifactCurrent, unmonRec.ArtifactState)
 	}
 }
 
