@@ -3,6 +3,11 @@
 All notable changes to Conductor are recorded here. Versions follow
 [semantic versioning](https://semver.org/); each release is a tag on `main`.
 
+## 0.65.0 — 2026-11-26
+
+- A Jellyfin tuner surface mirrors the HDHomeRun lineup under `/jellyfin/` (`discover.json`, `lineup.json`, `auto/v<n>`) so a Jellyfin server can tune Conductor alongside Plex without changing anything Plex reads. Stream errors there return the status with an empty body: Jellyfin copies any response body into its live buffer as media, so a readable 503 used to surface as a broken stream rather than a failed tune.
+- `/jellyfin/xmltv.xml` serves the same guide with provider ids in the spelling Jellyfin's XMLTV reader parses (`themoviedb.org` `603` / `series/1400`, `imdb.com` `episode/tt…` / `series/tt…`). `/xmltv.xml` and `/epg.xml` are unchanged.
+
 ## 0.64.1 — 2026-11-21
 
 - When an episode or movie previously captured for Sonarr or Radarr (`reconcile:*`, `torznab:*`) remains unimported (`hasFile=false`) and is explicitly unmonitored in Sonarr or Radarr, `RetentionWorker` now transitions it to the unrequested retention window (`CONDUCTOR_DVR_UNREQUESTED_RETENTION`, default `720h`) instead of retrying `ArrImport` indefinitely; captures whose episode metadata is not yet matched in Sonarr still remain preserved.

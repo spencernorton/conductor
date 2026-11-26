@@ -43,7 +43,7 @@ func TestWriteStreamStartupErrorMapsAdmissionContentionTo503(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			response := httptest.NewRecorder()
-			if !writeStreamStartupError(response, tt.err) {
+			if !writeStreamStartupError(response, tt.err, http.Error) {
 				t.Fatal("admission contention was not recognized as a startup error")
 			}
 			if response.Code != http.StatusServiceUnavailable {
@@ -64,7 +64,7 @@ func TestMidstreamRelocationUnknownDoesNotAppendHTTPErrorToMedia(t *testing.T) {
 	if _, err := response.Write(media); err != nil {
 		t.Fatal(err)
 	}
-	if writeStreamStartupError(response, store.ErrRelocationStateUnknown) {
+	if writeStreamStartupError(response, store.ErrRelocationStateUnknown, http.Error) {
 		t.Fatal("midstream relocation marker was treated as a pre-byte HTTP error")
 	}
 	if got := response.Body.Bytes(); !bytes.Equal(got, media) {
@@ -82,7 +82,7 @@ func TestPoolClosedAfterCommittedMediaDoesNotAppendHTTPError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if writeStreamStartupErrorIfUncommitted(tracked, stream.ErrPoolClosed) {
+	if writeStreamStartupErrorIfUncommitted(tracked, stream.ErrPoolClosed, http.Error) {
 		t.Fatal("pool-close error was written after the media response committed")
 	}
 	if got := response.Body.Bytes(); !bytes.Equal(got, media) {
@@ -103,7 +103,7 @@ func TestPoolClosedAfterCommittedMediaTraversesGzipMiddleware(t *testing.T) {
 		if _, err := w.Write(media); err != nil {
 			t.Fatal(err)
 		}
-		wroteStartupError = writeStreamStartupErrorIfUncommitted(w, stream.ErrPoolClosed)
+		wroteStartupError = writeStreamStartupErrorIfUncommitted(w, stream.ErrPoolClosed, http.Error)
 	})
 	request := httptest.NewRequest(http.MethodGet, "/auto/v22", nil)
 	request.Header.Set("Accept-Encoding", "gzip")
@@ -136,7 +136,7 @@ func TestResponseCommitmentCycleFailsClosed(t *testing.T) {
 	if !responseCommitted(wrapped) {
 		t.Fatal("cyclic response wrapper was treated as safely uncommitted")
 	}
-	if writeStreamStartupErrorIfUncommitted(wrapped, stream.ErrPoolClosed) {
+	if writeStreamStartupErrorIfUncommitted(wrapped, stream.ErrPoolClosed, http.Error) {
 		t.Fatal("startup plaintext was written through a cyclic response wrapper")
 	}
 }
@@ -144,7 +144,7 @@ func TestResponseCommitmentCycleFailsClosed(t *testing.T) {
 func TestPoolClosedBeforeCommitWritesRetryableError(t *testing.T) {
 	response := httptest.NewRecorder()
 	tracked := &statusWriter{ResponseWriter: response, code: http.StatusOK}
-	if !writeStreamStartupErrorIfUncommitted(tracked, stream.ErrPoolClosed) {
+	if !writeStreamStartupErrorIfUncommitted(tracked, stream.ErrPoolClosed, http.Error) {
 		t.Fatal("pre-byte pool-close error was not mapped")
 	}
 	if response.Code != http.StatusServiceUnavailable {

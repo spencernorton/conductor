@@ -62,7 +62,7 @@ type Deps struct {
 func NewRouter(d Deps) http.Handler {
 	mux := http.NewServeMux()
 
-	hh := hdhr.New(d.Device, lineupFunc(d))
+	hh := hdhr.New(d.Device, lineupFunc(d, d.Device.BaseURL))
 
 	// HDHomeRun emulator surface.
 	mux.HandleFunc("GET /discover.json", hh.Discover)
@@ -74,7 +74,17 @@ func NewRouter(d Deps) http.Handler {
 	// Plex hits `/auto/v<num>`. Go's ServeMux does not support partial-segment
 	// wildcards, so we register `/auto/{vch}` and strip the `v` prefix in
 	// the handler. The URL Plex sees from /lineup.json is unchanged.
-	mux.HandleFunc("GET /auto/{vch}", streamHandler(d))
+	mux.HandleFunc("GET /auto/{vch}", streamHandler(d, http.Error))
+
+	// Jellyfin tunes the same lineup under /jellyfin. Its HTTP tuner copies
+	// any response body as media without checking the status, so stream
+	// errors there carry no body and fail the tune at once.
+	jd := d.Device
+	jd.BaseURL += "/jellyfin"
+	jh := hdhr.New(jd, lineupFunc(d, jd.BaseURL))
+	mux.HandleFunc("GET /jellyfin/discover.json", jh.Discover)
+	mux.HandleFunc("GET /jellyfin/lineup.json", jh.LineupJSON)
+	mux.HandleFunc("GET /jellyfin/auto/{vch}", streamHandler(d, bodylessError))
 
 	// Admin CRUD (Phase 1+). Wraps in auth middleware (or no-op when disabled).
 	if d.DB != nil {
@@ -97,6 +107,12 @@ func NewRouter(d Deps) http.Handler {
 		// re-fetches every ~12h; XMLTV compresses ~10× (audit Q5).
 		mux.HandleFunc("GET /xmltv.xml", gzipped(eo.ServeHTTP))
 		mux.HandleFunc("GET /epg.xml", gzipped(eo.ServeHTTP))
+
+		// Jellyfin's XMLTV reader parses provider ids only in its own spelling.
+		jo := epg.NewOutput(d.DB, d.Device.BaseURL)
+		jo.LogoBaseURL = d.LogoBaseURL
+		jo.JellyfinIDs = true
+		mux.HandleFunc("GET /jellyfin/xmltv.xml", gzipped(jo.ServeHTTP))
 	}
 
 	// Prometheus exposition (audit Q1). Unauthenticated like /healthz —
@@ -152,7 +168,7 @@ func NewRouter(d Deps) http.Handler {
 
 // lineupFunc returns the right LineupFunc for the deployment mode.
 // DB-backed when DB+SeedLineup is configured; static otherwise.
-func lineupFunc(d Deps) hdhr.LineupFunc {
+func lineupFunc(d Deps, baseURL string) hdhr.LineupFunc {
 	if d.DB == nil {
 		seed := d.SeedLineup
 		return func(context.Context) ([]hdhr.Channel, error) { return seed, nil }
@@ -167,7 +183,7 @@ func lineupFunc(d Deps) hdhr.LineupFunc {
 			out = append(out, hdhr.Channel{
 				GuideNumber: trimZero(c.Number),
 				GuideName:   c.Name,
-				URL:         fmt.Sprintf("%s/auto/v%s", d.Device.BaseURL, trimZero(c.Number)),
+				URL:         fmt.Sprintf("%s/auto/v%s", baseURL, trimZero(c.Number)),
 				HD:          1,
 			})
 		}
@@ -180,9 +196,15 @@ func lineupFunc(d Deps) hdhr.LineupFunc {
 	}
 }
 
+// errorWriter writes a stream error response; http.Error for Plex,
+// bodylessError for Jellyfin.
+type errorWriter func(w http.ResponseWriter, msg string, code int)
+
+func bodylessError(w http.ResponseWriter, _ string, code int) { w.WriteHeader(code) }
+
 // streamHandler routes /auto/v<num> to the Pool (DB mode) or to a stub
 // upstream (no-DB mode).
-func streamHandler(d Deps) http.HandlerFunc {
+func streamHandler(d Deps, fail errorWriter) http.HandlerFunc {
 	const phase0TestUpstream = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
 	return func(w http.ResponseWriter, r *http.Request) {
 		ch := strings.TrimPrefix(r.PathValue("vch"), "v")
@@ -202,7 +224,7 @@ func streamHandler(d Deps) http.HandlerFunc {
 		// DB mode: resolve channel by number, lease, serve via Pool.
 		num, err := strconv.ParseFloat(ch, 64)
 		if err != nil {
-			http.Error(w, "invalid channel number: "+ch, http.StatusBadRequest)
+			fail(w, "invalid channel number: "+ch, http.StatusBadRequest)
 			return
 		}
 		lookupCtx, cancelLookup := context.WithDeadline(serveCtx, startupDeadline)
@@ -210,21 +232,21 @@ func streamHandler(d Deps) http.HandlerFunc {
 		cancelLookup()
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				http.Error(w, "upstream did not start", http.StatusServiceUnavailable)
+				fail(w, "upstream did not start", http.StatusServiceUnavailable)
 				return
 			}
 			if errors.Is(err, store.ErrNotFound) {
-				http.Error(w, "channel not found", http.StatusNotFound)
+				fail(w, "channel not found", http.StatusNotFound)
 				return
 			}
 			d.Logger.Warn("channel lookup", "channel", ch, "err", err)
-			http.Error(w, "channel lookup failed", http.StatusInternalServerError)
+			fail(w, "channel lookup failed", http.StatusInternalServerError)
 			return
 		}
 		if err := d.Pool.Serve(serveCtx, w, r, channel.ID); err != nil {
 			if !responseCommitted(w) {
 				logStreamStartupError(d.Logger, ch, r.RemoteAddr, time.Since(started), err)
-				if writeStreamStartupErrorIfUncommitted(w, err) {
+				if writeStreamStartupErrorIfUncommitted(w, err, fail) {
 					return
 				}
 			}
@@ -254,11 +276,11 @@ func logStreamStartupError(logger *slog.Logger, channel, remote string, elapsed 
 // writeStreamStartupErrorIfUncommitted prevents a shutdown or other typed
 // startup marker from appending plaintext after Pool has already committed an
 // MPEG-TS response. The logging middleware supplies the commitment tracker.
-func writeStreamStartupErrorIfUncommitted(w http.ResponseWriter, err error) bool {
+func writeStreamStartupErrorIfUncommitted(w http.ResponseWriter, err error, fail errorWriter) bool {
 	if responseCommitted(w) {
 		return false
 	}
-	return writeStreamStartupError(w, err)
+	return writeStreamStartupError(w, err, fail)
 }
 
 func responseCommitted(w http.ResponseWriter) bool {
@@ -298,26 +320,26 @@ func responseCommitted(w http.ResponseWriter) bool {
 // admission locks must be a retryable 503 for Plex, never an implicit
 // 200-with-empty-body. Other errors may describe a stream that ended after a
 // 200 was already written, so the caller only logs those.
-func writeStreamStartupError(w http.ResponseWriter, err error) bool {
+func writeStreamStartupError(w http.ResponseWriter, err error, fail errorWriter) bool {
 	switch {
 	case errors.Is(err, store.ErrNoSlot):
-		http.Error(w, "no upstream slots available", http.StatusServiceUnavailable)
+		fail(w, "no upstream slots available", http.StatusServiceUnavailable)
 		return true
 	case errors.Is(err, store.ErrAdmissionContention):
-		http.Error(w, "upstream admission busy; retry", http.StatusServiceUnavailable)
+		fail(w, "upstream admission busy; retry", http.StatusServiceUnavailable)
 		return true
 	case errors.Is(err, store.ErrLeaseOperational):
 		// AcquireLease adds this marker only to pre-pump source/DB/resolver
 		// failures. Midstream relocation consumes its errors inside the pump.
-		http.Error(w, "upstream admission failed; retry", http.StatusServiceUnavailable)
+		fail(w, "upstream admission failed; retry", http.StatusServiceUnavailable)
 		return true
 	case errors.Is(err, stream.ErrPoolClosed):
 		// Pool.Close can win after lease acquisition but before the first byte.
 		// Plex must see a retryable startup failure, never implicit empty 200.
-		http.Error(w, "stream temporarily unavailable; retry", http.StatusServiceUnavailable)
+		fail(w, "stream temporarily unavailable; retry", http.StatusServiceUnavailable)
 		return true
 	case errors.Is(err, stream.ErrUpstreamNotReady):
-		http.Error(w, "upstream did not start", http.StatusServiceUnavailable)
+		fail(w, "upstream did not start", http.StatusServiceUnavailable)
 		return true
 	default:
 		return false

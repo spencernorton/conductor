@@ -40,6 +40,13 @@ Pair Plex through Live TV & DVR → Set up Plex DVR → manual address, using
 `http://your-host:8409`. Add configuration through the authenticated admin API;
 the API contract is in [the technical specification](spec/dispatcharr-replacement-spec.md).
 
+To add Jellyfin as well, add an HDHomeRun tuner with the URL
+`http://your-host:8409/jellyfin` and an XMLTV guide at
+`http://your-host:8409/jellyfin/xmltv.xml`. Turn off hardware transcoding on
+that tuner, since Conductor serves one stream per channel, and set its tuner
+count below Conductor's so Plex keeps a slot. Both servers share Conductor's
+slots.
+
 ## Configuration map
 
 | Variable | Purpose |

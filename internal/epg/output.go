@@ -30,6 +30,10 @@ type Output struct {
 	// served from /logos/. Stream URLs stay on baseURL.
 	LogoBaseURL string
 
+	// JellyfinIDs spells provider ids the way Jellyfin's XMLTV reader
+	// parses them (see emitJellyfinIDs) instead of the Plex spelling.
+	JellyfinIDs bool
+
 	cacheMu   sync.RWMutex
 	cachedTag string
 	cachedXML []byte
@@ -121,7 +125,7 @@ func (o *Output) serveCachedXMLTV(
 
 	var buf bytes.Buffer
 	buf.Grow(len(rows) * 512)
-	emitXMLTVProjectedWriter(&buf, rows, baseURL)
+	emitXMLTVProjectedWriter(&buf, rows, baseURL, o.JellyfinIDs)
 	body := buf.Bytes()
 
 	o.cacheMu.Lock()
@@ -356,14 +360,14 @@ func emitXMLTV(w http.ResponseWriter, rows []store.ProgramOutputRow, baseURL str
 }
 
 func emitXMLTVProjected(w http.ResponseWriter, rows []store.ProgramOutputRow, baseURL string) {
-	emitXMLTVProjectedWriter(w, rows, baseURL)
+	emitXMLTVProjectedWriter(w, rows, baseURL, false)
 }
 
 type xmlWriter interface {
 	Write([]byte) (int, error)
 }
 
-func emitXMLTVProjectedWriter(w xmlWriter, rows []store.ProgramOutputRow, baseURL string) {
+func emitXMLTVProjectedWriter(w xmlWriter, rows []store.ProgramOutputRow, baseURL string, jellyfinIDs bool) {
 	_, _ = w.Write([]byte(xml.Header))
 	_, _ = w.Write([]byte(`<tv generator-info-name="Conductor" source-info-name="conductor">` + "\n"))
 
@@ -393,7 +397,7 @@ func emitXMLTVProjectedWriter(w xmlWriter, rows []store.ProgramOutputRow, baseUR
 		if r.IsPlaceholder {
 			continue
 		}
-		emitProgramme(w, r, baseURL)
+		writeProgramme(w, r, baseURL, jellyfinIDs)
 	}
 
 	_, _ = w.Write([]byte(`</tv>` + "\n"))
@@ -445,6 +449,10 @@ func emitChannel(w xmlWriter, r store.ProgramOutputRow, id, baseURL string) {
 }
 
 func emitProgramme(w xmlWriter, r store.ProgramOutputRow, baseURL string) {
+	writeProgramme(w, r, baseURL, false)
+}
+
+func writeProgramme(w xmlWriter, r store.ProgramOutputRow, baseURL string, jellyfinIDs bool) {
 	chID := xmltvChannelID(r)
 	fmt.Fprintf(w, "  <programme channel=%q start=%q stop=%q>\n",
 		chID, formatXMLTVTime(r.StartAt), formatXMLTVTime(r.EndAt))
@@ -553,15 +561,19 @@ func emitProgramme(w xmlWriter, r store.ProgramOutputRow, baseURL string) {
 	}
 	// IMDb id helps Plex's "EPG match priority" rules nail the right entry
 	// in its internal library (per spec §14: IMDb id > TMDb id > title+year).
-	if r.EnrichmentIMDbID != "" {
-		fmt.Fprintf(w, `    <episode-num system="imdb.com">title/%s</episode-num>`+"\n", xmlEscape(r.EnrichmentIMDbID))
-	}
-	if r.EnrichmentTMDbID > 0 {
-		kind := "tv"
-		if r.IsMovie {
-			kind = "movie"
+	if jellyfinIDs {
+		emitJellyfinIDs(w, r)
+	} else {
+		if r.EnrichmentIMDbID != "" {
+			fmt.Fprintf(w, `    <episode-num system="imdb.com">title/%s</episode-num>`+"\n", xmlEscape(r.EnrichmentIMDbID))
 		}
-		fmt.Fprintf(w, `    <episode-num system="themoviedb.org">%s/%d</episode-num>`+"\n", kind, r.EnrichmentTMDbID)
+		if r.EnrichmentTMDbID > 0 {
+			kind := "tv"
+			if r.IsMovie {
+				kind = "movie"
+			}
+			fmt.Fprintf(w, `    <episode-num system="themoviedb.org">%s/%d</episode-num>`+"\n", kind, r.EnrichmentTMDbID)
+		}
 	}
 	if r.Rating != "" {
 		fmt.Fprintf(w, `    <rating system="MPAA"><value>%s</value></rating>`+"\n", xmlEscape(r.Rating))
@@ -592,6 +604,28 @@ func emitProgramme(w xmlWriter, r store.ProgramOutputRow, baseURL string) {
 		fmt.Fprintln(w, `    <finale/>`)
 	}
 	fmt.Fprintln(w, `  </programme>`)
+}
+
+// emitJellyfinIDs writes the forms Jellyfin's XMLTV reader turns into
+// provider ids: a movie's own TMDb and IMDb ids ("603", "episode/tt…"), and
+// for anything else the series ids ("series/1399", "series/tt…"), which is
+// what enrichment matches for an episode.
+func emitJellyfinIDs(w xmlWriter, r store.ProgramOutputRow) {
+	if r.IsMovie {
+		if r.EnrichmentTMDbID > 0 {
+			fmt.Fprintf(w, `    <episode-num system="themoviedb.org">%d</episode-num>`+"\n", r.EnrichmentTMDbID)
+		}
+		if r.EnrichmentIMDbID != "" {
+			fmt.Fprintf(w, `    <episode-num system="imdb.com">episode/%s</episode-num>`+"\n", xmlEscape(r.EnrichmentIMDbID))
+		}
+		return
+	}
+	if r.EnrichmentTMDbID > 0 {
+		fmt.Fprintf(w, `    <episode-num system="themoviedb.org">series/%d</episode-num>`+"\n", r.EnrichmentTMDbID)
+	}
+	if r.EnrichmentIMDbID != "" {
+		fmt.Fprintf(w, `    <episode-num system="imdb.com">series/%s</episode-num>`+"\n", xmlEscape(r.EnrichmentIMDbID))
+	}
 }
 
 func validOriginalAirDate(originalAirDate, airingCivilDate *time.Time, startAt time.Time) bool {
