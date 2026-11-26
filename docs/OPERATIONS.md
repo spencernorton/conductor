@@ -45,7 +45,9 @@ To add Jellyfin as well, add an HDHomeRun tuner with the URL
 `http://your-host:8409/jellyfin/xmltv.xml`. Turn off hardware transcoding on
 that tuner, since Conductor serves one stream per channel, and set its tuner
 count below Conductor's so Plex keeps a slot. Both servers share Conductor's
-slots.
+slots. A channel Jellyfin starts gets Conductor's startup lead as a burst, so
+the client holds that margin in its own buffer; Plex keeps the lead queued in
+Conductor as before.
 
 ## Configuration map
 

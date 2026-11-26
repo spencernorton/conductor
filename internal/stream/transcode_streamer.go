@@ -1279,9 +1279,13 @@ func (s *TranscodeStreamer) runOnce(ctx context.Context) (gotBytes, upstreamFaul
 						// respawn never holds. The output watchdog is armed only
 						// by publication, so it does not run during the hold.
 						attemptMediaLive.Store(true)
-						if holdErr := holdStartupLead(attempt.ctx, s.startupLead,
-							s.startupHoldDeadline); holdErr != nil {
+						held, holdErr := holdStartupLead(attempt.ctx, s.startupLead,
+							s.startupHoldDeadline)
+						if holdErr != nil {
 							return false, false, attempt.wrap("stream", holdErr)
+						}
+						if s.allLeadBurst() {
+							pacer.BurstLead(held, s.allLeadBurst)
 						}
 					}
 					// Validation and schedule profiling happen behind a private

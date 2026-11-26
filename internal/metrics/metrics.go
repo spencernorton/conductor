@@ -115,6 +115,8 @@ var (
 	RelayRecoveryEpochs             = NewCounter("conductor_relay_recovery_epochs_total", "Live MPEG-TS pacing epochs accelerated to drain a validated prefix or a shared-arrival batch.")
 	RelayUnderflowReanchors         = NewCounter("conductor_relay_underflow_reanchors_total", "Live pacing schedules re-anchored after a source pause outlived the queued lead; the returning media is kept as lead, not raced to the live edge.")
 	RelayLeadTrimEpochs             = NewCounter("conductor_relay_lead_trim_epochs_total", "Bounded 2x pacing epochs that trimmed a retained lead back below the reservoir high-water mark.")
+	RelayLeadBursts                 = NewCounter("conductor_relay_lead_bursts_total", "Startup leads handed to lead-burst (Jellyfin) clients as a burst instead of queued as relay reservoir.")
+	RelayLeadBurstsEnded            = NewCounter("conductor_relay_lead_bursts_ended_total", "Startup lead bursts cut short because the pump stopped serving only lead-burst clients (a Plex or DVR subscriber attached, or the last one left).")
 	RelayRecoveryAcceleratedMS      = NewCounter("conductor_relay_recovery_accelerated_milliseconds_total", "PCR-scheduled milliseconds compressed by bounded live recovery pacing.")
 	RelayRecoveryBacklogFailures    = NewCounter("conductor_relay_recovery_backlog_failures_total", "Live MPEG-TS pacing rejected when its latency bound would require more than the maximum recovery rate.")
 	RelayBacklogFailures            = NewCounter("conductor_relay_backlog_failures_total", "Buffered MPEG-TS tails rejected before a shared arrival deadline would force zero-interval fanout.")
