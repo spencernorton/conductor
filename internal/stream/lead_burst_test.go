@@ -74,13 +74,13 @@ func TestTransportPCRPacerLeadBurst(t *testing.T) {
 		assertIntervals(t, intervals, 0, len(intervals), cadence)
 	})
 
-	t.Run("a burst releases the held lead at the maximum recovery rate", func(t *testing.T) {
+	t.Run("a burst releases at most maxLeadBurst of the held lead at the maximum recovery rate", func(t *testing.T) {
 		before := metrics.RelayLeadBursts.Value()
 		intervals := leadBurstPacerIntervals(t, true, func(int) bool { return true })
-		// Prefix (10 chunks) plus the 40-chunk lead leave at 16x, then the
-		// rest of the reservoir returns to media cadence.
-		assertIntervals(t, intervals, 0, 45, burst)
-		assertIntervals(t, intervals, 52, len(intervals), cadence)
+		// The prefix (10 chunks, 9 steps) plus 1s of the 2s lead (20 chunks)
+		// leave at 16x; the other 1s stays queued and leaves at media cadence.
+		assertIntervals(t, intervals, 0, 29, burst)
+		assertIntervals(t, intervals, 29, len(intervals), cadence)
 		if delta := metrics.RelayLeadBursts.Value() - before; delta != 1 {
 			t.Fatalf("lead burst metric delta=%d, want 1", delta)
 		}

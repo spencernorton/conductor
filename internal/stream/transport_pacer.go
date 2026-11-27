@@ -15,6 +15,10 @@ const (
 	maxTransportAddedLatency = time.Second
 	maxTransportPaceBehind   = 500 * time.Millisecond
 	maxTransportRecoveryRate = 16
+	// maxLeadBurst caps how much of the startup lead BurstLead hands a
+	// Jellyfin client; the rest stays queued as reservoir for a Plex or DVR
+	// client that joins the same pump after the burst.
+	maxLeadBurst = time.Second
 	// The live read-ahead handoff is byte-bounded, not duration-bounded. At a
 	// lower bitrate its one queued chunk plus the producer-held chunk can be
 	// more than 100ms old even after backpressure has reached the source edge.
@@ -848,9 +852,9 @@ func (p *transportPCRPacer) PrepareBufferedPrefix(data []byte, partSize int) err
 }
 
 // BurstLead stretches the startup epoch PrepareBufferedPrefix opened through
-// lead more media and releases it at the maximum recovery rate, so the lead
-// held behind the prefix reaches a client that buffers for itself (Jellyfin)
-// at once instead of staying queued here as reservoir. Call it after the
+// up to maxLeadBurst of the held lead and releases it at the maximum recovery
+// rate, so that part reaches a client that buffers for itself (Jellyfin) at
+// once instead of staying queued here as reservoir. Call it after the
 // startup hold and before the first Wait. Like a lead trim, only its budget
 // ends it, since a queued reservoir always looks like a source edge. It ends
 // at once when allowed reports a subscriber that relies on this relay's
@@ -862,7 +866,7 @@ func (p *transportPCRPacer) BurstLead(lead time.Duration, allowed func() bool) {
 	}
 	p.prefixRate, p.prefixBudget = p.pendingRate, p.pendingBudget
 	p.pendingRate = maxTransportRecoveryRate
-	p.pendingBudget += lead
+	p.pendingBudget += min(lead, maxLeadBurst)
 	p.leadBurstAllowed = allowed
 	metrics.RelayLeadBursts.Inc()
 }

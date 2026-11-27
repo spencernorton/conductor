@@ -98,8 +98,8 @@ func WithStartupDeadline(ctx context.Context, deadline time.Time) context.Contex
 type leadBurstContextKey struct{}
 
 // WithLeadBurst marks a tune whose client buffers the startup lead itself
-// (Jellyfin). A pump this tune starts may release its held lead as a burst
-// while every attached subscriber carries the mark; see
+// (Jellyfin). A pump this tune starts may release part of its held lead as a
+// burst while every attached subscriber carries the mark; see
 // transportPCRPacer.BurstLead.
 func WithLeadBurst(ctx context.Context) context.Context {
 	return context.WithValue(ctx, leadBurstContextKey{}, true)

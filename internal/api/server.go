@@ -79,8 +79,8 @@ func NewRouter(d Deps) http.Handler {
 	// Jellyfin tunes the same lineup under /jellyfin. Its HTTP tuner copies
 	// any response body as media without checking the status, so stream
 	// errors there carry no body and fail the tune at once. Its clients
-	// buffer for themselves, so a pump they start hands them the startup
-	// lead as a burst (stream.WithLeadBurst).
+	// buffer for themselves, so a pump they start hands them up to 1s of the
+	// startup lead as a burst (stream.WithLeadBurst).
 	jd := d.Device
 	jd.BaseURL += "/jellyfin"
 	jh := hdhr.New(jd, lineupFunc(d, jd.BaseURL))
