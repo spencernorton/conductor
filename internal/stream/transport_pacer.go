@@ -939,6 +939,7 @@ func (p *transportPCRPacer) PrepareSharedArrivalBatch(data []byte, partSize int)
 	if p.recoveryRate > 0 {
 		p.epochBudget += span
 	} else {
+		p.leadBurstAllowed = nil // any lead burst epoch has ended; this one is the batch's
 		p.epochBudget = span
 		p.epochMedia = 0
 	}

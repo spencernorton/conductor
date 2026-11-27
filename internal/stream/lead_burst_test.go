@@ -102,6 +102,64 @@ func TestTransportPCRPacerLeadBurst(t *testing.T) {
 	})
 }
 
+func TestTransportPCRPacerSharedBatchAfterLeadBurstIsNotTheBurst(t *testing.T) {
+	// A coalesced batch can open its own recovery epoch between the Wait that
+	// ends the burst and the next one; a Plex join then must not end that
+	// epoch as if it were the burst.
+	const step = 50 * time.Millisecond
+	wall := time.Unix(1_700_000_000, 0)
+	pacer := testTransportPCRPacer(false)
+	pacer.now = func() time.Time { return wall }
+	pacer.wait = func(_ context.Context, delay time.Duration) error {
+		wall = wall.Add(delay)
+		return nil
+	}
+	chunks := pcrSparseTestChunks(90, step)
+	if err := pacer.PrepareBufferedPrefix(bytes.Join(chunks[:10], nil), chunkSize); err != nil {
+		t.Fatal(err)
+	}
+	plainJoined := false
+	pacer.BurstLead(time.Second, func() bool { return !plainJoined })
+	release := wall
+	next := 0
+	for ; next < 50; next++ {
+		arrival := wall
+		if next < 10 {
+			arrival = release
+		}
+		if err := pacer.Wait(context.Background(), chunks[next], arrival); err != nil {
+			t.Fatalf("chunk %d: %v", next, err)
+		}
+		if next >= 10 && pacer.recoveryRate == 0 {
+			next++
+			break
+		}
+	}
+	if pacer.recoveryRate != 0 {
+		t.Fatal("the burst epoch never ended")
+	}
+	batch := chunks[next : next+30] // 1.5s of media under one arrival
+	pacer.PrepareSharedArrivalBatch(bytes.Join(batch, nil), chunkSize)
+	rate := pacer.recoveryRate
+	if rate <= 1 {
+		t.Fatalf("batch epoch rate=%d, want >1", rate)
+	}
+	plainJoined = true
+	before := metrics.RelayLeadBurstsEnded.Value()
+	arrival := wall
+	for i, chunk := range batch {
+		if err := pacer.Wait(context.Background(), chunk, arrival); err != nil {
+			t.Fatalf("batch chunk %d: %v", i, err)
+		}
+		if i == 0 && pacer.recoveryRate != rate {
+			t.Fatalf("batch epoch rate=%d after a Plex join, want %d", pacer.recoveryRate, rate)
+		}
+	}
+	if delta := metrics.RelayLeadBurstsEnded.Value() - before; delta != 0 {
+		t.Fatalf("a Plex join after the burst counted as ending it (delta=%d)", delta)
+	}
+}
+
 func TestTransportPCRPacerBurstLeadIgnoredOutsideStartup(t *testing.T) {
 	finite := testTransportPCRPacer(true)
 	_ = finite.PrepareBufferedPrefix(bytes.Join(pcrSparseTestChunks(10, 50*time.Millisecond), nil), chunkSize)
