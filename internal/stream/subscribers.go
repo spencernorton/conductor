@@ -91,6 +91,11 @@ type subscriber struct {
 	// routed exclusively through firstReal. Only the pump transitions true to
 	// false; atomic keeps the closed/preload path race-safe.
 	awaitingReal atomic.Bool
+
+	// leadBurst marks a client that buffers the startup lead itself; see
+	// SubscribeForStartupLeadBurst. It is set just after admission, so for a
+	// moment the subscriber reads as plain, which only ever withholds a burst.
+	leadBurst atomic.Bool
 }
 
 type startupChunk struct {
@@ -735,6 +740,33 @@ func (ss *subscriberSet) SubscribeForStartup(clientID string) (
 	// queue exhaustion, delivery timeout, and pump terminalization all close it
 	// synchronously before the worker later closes its public channels.
 	return sub.firstReal, sub.startupCh, sub.done, cleanup
+}
+
+// SubscribeForStartupLeadBurst is SubscribeForStartup for a client that holds
+// its own playback buffer (Jellyfin). While every attached subscriber came in
+// this way, the pump hands its held startup lead over as a burst.
+func (ss *subscriberSet) SubscribeForStartupLeadBurst(clientID string) (
+	<-chan startupChunk,
+	<-chan startupChunk,
+	<-chan struct{},
+	func(),
+) {
+	sub, cleanup := ss.subscribe(clientID, true)
+	sub.leadBurst.Store(true)
+	return sub.firstReal, sub.startupCh, sub.done, cleanup
+}
+
+// allLeadBurst reports whether at least one subscriber is attached and every
+// one of them buffers the startup lead itself.
+func (ss *subscriberSet) allLeadBurst() bool {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	for _, sub := range ss.subs {
+		if !sub.leadBurst.Load() {
+			return false
+		}
+	}
+	return len(ss.subs) > 0
 }
 
 func (ss *subscriberSet) subscribe(clientID string, startup bool) (*subscriber, func()) {

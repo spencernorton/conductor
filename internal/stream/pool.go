@@ -1445,7 +1445,7 @@ func (p *Pool) getOrStartStreamer(
 		return nil, nil, nil, nil, nil, ErrPoolClosed
 	}
 	if e, ok := p.streamers[lease.ActiveStreamID]; ok && !e.pump.Stopping() {
-		firstReal, chunks, subscriberTerminal, unsubscribe := e.pump.SubscribeForStartup(clientID)
+		firstReal, chunks, subscriberTerminal, unsubscribe := attachForStartup(ctx, e.pump, clientID)
 		p.mu.Unlock()
 		return e.pump, firstReal, chunks, subscriberTerminal, unsubscribe, nil
 	}
@@ -1488,7 +1488,7 @@ func (p *Pool) getOrStartStreamer(
 		return nil, nil, nil, nil, nil, ErrPoolClosed
 	}
 	if e, ok := p.streamers[lease.ActiveStreamID]; ok && !e.pump.Stopping() {
-		firstReal, chunks, subscriberTerminal, unsubscribe := e.pump.SubscribeForStartup(clientID)
+		firstReal, chunks, subscriberTerminal, unsubscribe := attachForStartup(ctx, e.pump, clientID)
 		p.mu.Unlock()
 		return e.pump, firstReal, chunks, subscriberTerminal, unsubscribe, nil
 	}
@@ -1816,7 +1816,7 @@ func (p *Pool) getOrStartStreamer(
 	// byte. This closes the create/start race for fast accepted finite media;
 	// concurrent creators cannot reach this block because creationLock remains
 	// held from the authoritative generation claim through installation.
-	firstReal, chunks, subscriberTerminal, unsubscribe := pump.SubscribeForStartup(clientID)
+	firstReal, chunks, subscriberTerminal, unsubscribe := attachForStartup(ctx, pump, clientID)
 	p.streamers[streamID] = pumpEntry{
 		pump:         pump,
 		cancel:       pumpCancel,
@@ -1830,6 +1830,23 @@ func (p *Pool) getOrStartStreamer(
 	metrics.StreamsStarted.Inc()
 	go p.runPump(pumpCtx, pump)
 	return pump, firstReal, chunks, subscriberTerminal, unsubscribe, nil
+}
+
+// leadBurstSubscriber is implemented by the production pumps through their
+// embedded subscriberSet.
+type leadBurstSubscriber interface {
+	SubscribeForStartupLeadBurst(clientID string) (<-chan startupChunk, <-chan startupChunk, <-chan struct{}, func())
+}
+
+// attachForStartup attaches a Jellyfin tune (WithLeadBurst) as a
+// lead-burst subscriber and every other caller exactly as before.
+func attachForStartup(ctx context.Context, pump streamPump, clientID string) (
+	<-chan startupChunk, <-chan startupChunk, <-chan struct{}, func(),
+) {
+	if b, ok := pump.(leadBurstSubscriber); ok && leadBurstRequested(ctx) {
+		return b.SubscribeForStartupLeadBurst(clientID)
+	}
+	return pump.SubscribeForStartup(clientID)
 }
 
 func (p *Pool) runPump(ctx context.Context, pump streamPump) {

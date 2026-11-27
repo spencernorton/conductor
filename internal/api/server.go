@@ -74,17 +74,19 @@ func NewRouter(d Deps) http.Handler {
 	// Plex hits `/auto/v<num>`. Go's ServeMux does not support partial-segment
 	// wildcards, so we register `/auto/{vch}` and strip the `v` prefix in
 	// the handler. The URL Plex sees from /lineup.json is unchanged.
-	mux.HandleFunc("GET /auto/{vch}", streamHandler(d, http.Error))
+	mux.HandleFunc("GET /auto/{vch}", streamHandler(d, http.Error, false))
 
 	// Jellyfin tunes the same lineup under /jellyfin. Its HTTP tuner copies
 	// any response body as media without checking the status, so stream
-	// errors there carry no body and fail the tune at once.
+	// errors there carry no body and fail the tune at once. Its clients
+	// buffer for themselves, so a pump they start hands them up to 1s of the
+	// startup lead as a burst (stream.WithLeadBurst).
 	jd := d.Device
 	jd.BaseURL += "/jellyfin"
 	jh := hdhr.New(jd, lineupFunc(d, jd.BaseURL))
 	mux.HandleFunc("GET /jellyfin/discover.json", jh.Discover)
 	mux.HandleFunc("GET /jellyfin/lineup.json", jh.LineupJSON)
-	mux.HandleFunc("GET /jellyfin/auto/{vch}", streamHandler(d, bodylessError))
+	mux.HandleFunc("GET /jellyfin/auto/{vch}", streamHandler(d, bodylessError, true))
 
 	// Admin CRUD (Phase 1+). Wraps in auth middleware (or no-op when disabled).
 	if d.DB != nil {
@@ -203,14 +205,18 @@ type errorWriter func(w http.ResponseWriter, msg string, code int)
 func bodylessError(w http.ResponseWriter, _ string, code int) { w.WriteHeader(code) }
 
 // streamHandler routes /auto/v<num> to the Pool (DB mode) or to a stub
-// upstream (no-DB mode).
-func streamHandler(d Deps, fail errorWriter) http.HandlerFunc {
+// upstream (no-DB mode). leadBurst marks tunes whose client buffers the
+// startup lead itself; Plex's /auto never sets it.
+func streamHandler(d Deps, fail errorWriter, leadBurst bool) http.HandlerFunc {
 	const phase0TestUpstream = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
 	return func(w http.ResponseWriter, r *http.Request) {
 		ch := strings.TrimPrefix(r.PathValue("vch"), "v")
 		started := time.Now()
 		startupDeadline := started.Add(stream.ClientStartupBudget)
 		serveCtx := stream.WithStartupDeadline(r.Context(), startupDeadline)
+		if leadBurst {
+			serveCtx = stream.WithLeadBurst(serveCtx)
+		}
 
 		// No-DB mode: serve a single hardcoded test stream so Plex pairing
 		// can complete on a fresh install.

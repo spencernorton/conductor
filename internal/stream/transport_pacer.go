@@ -15,6 +15,10 @@ const (
 	maxTransportAddedLatency = time.Second
 	maxTransportPaceBehind   = 500 * time.Millisecond
 	maxTransportRecoveryRate = 16
+	// maxLeadBurst caps how much of the startup lead BurstLead hands a
+	// Jellyfin client; the rest stays queued as reservoir for a Plex or DVR
+	// client that joins the same pump after the burst.
+	maxLeadBurst = time.Second
 	// The live read-ahead handoff is byte-bounded, not duration-bounded. At a
 	// lower bitrate its one queued chunk plus the producer-held chunk can be
 	// more than 100ms old even after backpressure has reached the source edge.
@@ -737,8 +741,13 @@ type transportPCRPacer struct {
 	// backlogChunks is the reservoir depth reported by the read loop before
 	// each Wait; it only decides when a lead trim opens.
 	backlogChunks int
-	now           func() time.Time
-	wait          func(context.Context, time.Duration) error
+	// leadBurstAllowed is non-nil while BurstLead's startup epoch runs; the
+	// prefix* fields are that epoch as PrepareBufferedPrefix opened it.
+	leadBurstAllowed func() bool
+	prefixRate       int
+	prefixBudget     time.Duration
+	now              func() time.Time
+	wait             func(context.Context, time.Duration) error
 }
 
 // Configure binds pacing to the PCR_PID from the exact PAT/PMT program that
@@ -765,6 +774,7 @@ func (p *transportPCRPacer) Configure(pcrPID int, finiteReplay bool) {
 	p.pendingBudget = 0
 	p.trimEpoch = false
 	p.backlogChunks = 0
+	p.leadBurstAllowed = nil
 }
 
 // NoteBacklog records the reservoir depth (queued, not yet dequeued chunks)
@@ -841,6 +851,66 @@ func (p *transportPCRPacer) PrepareBufferedPrefix(data []byte, partSize int) err
 	return nil
 }
 
+// BurstLead stretches the startup epoch PrepareBufferedPrefix opened through
+// up to maxLeadBurst of the held lead and releases it at the maximum recovery
+// rate, so that part reaches a client that buffers for itself (Jellyfin) at
+// once instead of staying queued here as reservoir. Call it after the
+// startup hold and before the first Wait. Like a lead trim, only its budget
+// ends it, since a queued reservoir always looks like a source edge. It ends
+// at once when allowed reports a subscriber that relies on this relay's
+// reservoir, and whatever is still queued then stays lead exactly as it would
+// without a burst.
+func (p *transportPCRPacer) BurstLead(lead time.Duration, allowed func() bool) {
+	if p.finiteReplay || p.haveOrigin || p.pendingStep == 0 || lead <= 0 {
+		return
+	}
+	p.prefixRate, p.prefixBudget = p.pendingRate, p.pendingBudget
+	p.pendingRate = maxTransportRecoveryRate
+	p.pendingBudget += min(lead, maxLeadBurst)
+	p.leadBurstAllowed = allowed
+	metrics.RelayLeadBursts.Inc()
+}
+
+// checkLeadBurst ends a lead burst whose subscribers no longer all buffer for
+// themselves, returning to the prefix epoch (or media cadence past it).
+func (p *transportPCRPacer) checkLeadBurst() {
+	if p.leadBurstAllowed == nil {
+		return
+	}
+	if p.haveOrigin && p.recoveryRate == 0 {
+		p.leadBurstAllowed = nil // the burst epoch already ended on its own
+		return
+	}
+	if p.leadBurstAllowed() {
+		return
+	}
+	p.leadBurstAllowed = nil
+	metrics.RelayLeadBurstsEnded.Inc()
+	if !p.haveOrigin {
+		if p.pendingRate > 0 {
+			p.pendingRate = p.prefixRate
+		} else {
+			p.recoveryRate = p.prefixRate
+		}
+		p.pendingBudget = p.prefixBudget
+		return
+	}
+	if p.prefixRate > 0 && p.epochMedia < p.prefixBudget {
+		p.recoveryRate = p.prefixRate
+		p.epochBudget = p.prefixBudget
+		return
+	}
+	// Re-anchor at the last emitted clock, as an epoch exit does.
+	p.recoveryRate = 0
+	p.epochBudget = 0
+	p.epochMedia = 0
+	p.trimEpoch = false
+	if p.haveLast && !p.lastPCREmit.IsZero() {
+		p.originClock = p.lastClock
+		p.originWall = p.lastPCREmit
+	}
+}
+
 // PrepareSharedArrivalBatch bounds the schedule of a multi-chunk media slice
 // that reaches a read loop under one shared source-arrival timestamp — a
 // publication-gate release, or reservoir reads coalesced while the pacer
@@ -869,6 +939,7 @@ func (p *transportPCRPacer) PrepareSharedArrivalBatch(data []byte, partSize int)
 	if p.recoveryRate > 0 {
 		p.epochBudget += span
 	} else {
+		p.leadBurstAllowed = nil // any lead burst epoch has ended; this one is the batch's
 		p.epochBudget = span
 		p.epochMedia = 0
 	}
@@ -948,6 +1019,7 @@ func waitTransportDelay(ctx context.Context, delay time.Duration) error {
 // preventing a consistently fast PCR clock from accumulating minutes of relay
 // backlog. Finite accepted replay is exempt and drains at its full PCR cadence.
 func (p *transportPCRPacer) Wait(ctx context.Context, data []byte, arrivedAt time.Time) (retErr error) {
+	p.checkLeadBurst()
 	clock, observed, reset := p.scanner.feed(data)
 	now := p.wallNow()
 	if arrivedAt.IsZero() || arrivedAt.After(now) {
@@ -1147,9 +1219,10 @@ func (p *transportPCRPacer) Wait(ctx context.Context, data []byte, arrivedAt tim
 		// catch-up burst is not enough; it must be at least half the media step.
 		atSourceEdge := mediaStep > 0 && arrivalStep > 0 &&
 			arrivalStep*2 >= mediaStep && now.Sub(arrivedAt) <= transportRecoveryEdgeLag
-		if p.holdEdgeExitOnce || p.trimEpoch {
-			// A lead trim dequeues from a deep reservoir, so its own paced
-			// cadence always looks like a source edge; only its budget ends it.
+		if p.holdEdgeExitOnce || p.trimEpoch || p.leadBurstAllowed != nil {
+			// A lead trim or lead burst dequeues from a deep reservoir, so its
+			// own paced cadence always looks like a source edge; only its budget
+			// ends it.
 			atSourceEdge = false
 			p.holdEdgeExitOnce = false
 		}

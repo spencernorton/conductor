@@ -120,10 +120,11 @@ const (
 // initiating client's absolute startup budget below the reserve, and only the
 // initial attempt holds; a reconnect must publish immediately because the
 // previous attempt's lead is already draining into the client. A hold that
-// outlives the attempt context returns that context's error.
-func holdStartupLead(ctx context.Context, lead time.Duration, startupDeadline time.Time) error {
+// outlives the attempt context returns that context's error. It returns how
+// long it held, which is the lead a lead burst may hand over.
+func holdStartupLead(ctx context.Context, lead time.Duration, startupDeadline time.Time) (time.Duration, error) {
 	if lead <= 0 {
-		return nil
+		return 0, nil
 	}
 	if !startupDeadline.IsZero() {
 		if remaining := time.Until(startupDeadline) - startupLeadDeadlineReserve; remaining < lead {
@@ -131,15 +132,15 @@ func holdStartupLead(ctx context.Context, lead time.Duration, startupDeadline ti
 		}
 	}
 	if lead <= 0 {
-		return nil
+		return 0, nil
 	}
 	timer := time.NewTimer(lead)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return 0, ctx.Err()
 	case <-timer.C:
-		return nil
+		return lead, nil
 	}
 }
 
@@ -673,9 +674,13 @@ func (s *Streamer) runOnce(ctx context.Context) (gotBytes bool, err error) {
 						if !attemptMediaLive.Swap(true) && producerState.Load() == 0 {
 							idle.Reset(s.stallTolerance)
 						}
-						if holdErr := holdStartupLead(attempt.ctx, s.startupLead,
-							s.startupHoldDeadline); holdErr != nil {
+						held, holdErr := holdStartupLead(attempt.ctx, s.startupLead,
+							s.startupHoldDeadline)
+						if holdErr != nil {
 							return false, attempt.wrap("stream", holdErr)
+						}
+						if s.allLeadBurst() {
+							pacer.BurstLead(held, s.allLeadBurst)
 						}
 					}
 					// Validation and schedule profiling happen behind a private

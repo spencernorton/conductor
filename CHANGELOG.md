@@ -3,6 +3,10 @@
 All notable changes to Conductor are recorded here. Versions follow
 [semantic versioning](https://semver.org/); each release is a tag on `main`.
 
+## 0.66.0 — 2026-11-26
+
+- A pump started from `/jellyfin/auto` hands up to 1 s of its startup lead (`CONDUCTOR_LIVE_STARTUP_LEAD`) to the client as a burst: after the usual hold, the validated prefix and that second leave together at the maximum recovery rate instead of trickling out in real time. Jellyfin's player reaches its start buffer about a second sooner, and that part of the margin sits in the client's buffer. The rest of the lead (3 s by default) stays queued in Conductor, so a Plex or DVR client that joins the channel later still has that reservoir against origin stalls. The burst runs only while every subscriber on the pump came in through `/jellyfin`; a Plex or DVR subscriber attaching ends it at once, and whatever is still queued stays as Conductor's reservoir. Pumps started by Plex (`/auto`) or the DVR are unchanged. New counters: `conductor_relay_lead_bursts_total` and `conductor_relay_lead_bursts_ended_total`.
+
 ## 0.65.0 — 2026-11-26
 
 - A Jellyfin tuner surface mirrors the HDHomeRun lineup under `/jellyfin/` (`discover.json`, `lineup.json`, `auto/v<n>`) so a Jellyfin server can tune Conductor alongside Plex without changing anything Plex reads. Stream errors there return the status with an empty body: Jellyfin copies any response body into its live buffer as media, so a readable 503 used to surface as a broken stream rather than a failed tune.
